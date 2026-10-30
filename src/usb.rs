@@ -24,7 +24,7 @@ const SUDO_PROMPT: &str = "[importer] password for %u: ";
 /// Is the fix needed? `None` means the autosuspend parameter can't be read
 /// (non-Linux), and the feature is inert. Otherwise it is needed when the
 /// parameter is anything but `-1`, or any device still allows autosuspend.
-pub fn fix_needed(autosuspend: Option<&str>, device_controls: &[String]) -> bool {
+fn fix_needed(autosuspend: Option<&str>, device_controls: &[String]) -> bool {
     let Some(autosuspend) = autosuspend else {
         return false;
     };
@@ -36,6 +36,8 @@ pub fn fix_needed(autosuspend: Option<&str>, device_controls: &[String]) -> bool
 
 /// Read the live controls and apply [`fix_needed`]. Unreadable files count as
 /// absent, which keeps a non-Linux machine on the "nothing to do" path.
+/// A few sysfs reads with no sudo, cheap enough to call on the UI thread
+/// before an Import so the privileged step is skipped when it isn't needed.
 pub fn is_fix_needed() -> bool {
     let autosuspend = std::fs::read_to_string(AUTOSUSPEND).ok();
     fix_needed(autosuspend.as_deref(), &device_controls())
@@ -56,9 +58,10 @@ fn device_controls() -> Vec<String> {
 /// safe, so a second Import in the same boot never asks for a password.
 ///
 /// sudo prompts on the controlling terminal itself (hidden input, its usual
-/// credential cache); the password never passes through this process. Errors
-/// carry sudo's own stderr, which is all a cancelled prompt, a wrong password
-/// or a missing terminal leave behind.
+/// credential cache); the password never passes through this process. The
+/// child inherits stderr so sudo's own diagnostics ("Sorry, try again.") reach
+/// the terminal; the header only carries a generic reason, and the io error
+/// text when sudo cannot even be spawned.
 pub fn apply() -> Result<(), String> {
     if !is_fix_needed() {
         return Ok(());
@@ -70,23 +73,16 @@ pub fn apply() -> Result<(), String> {
         "echo {SAFE_AUTOSUSPEND} > {AUTOSUSPEND} && \
          for c in {DEVICES}/*/power/control; do echo {SAFE_CONTROL} > \"$c\" 2>/dev/null || true; done"
     );
-    let output = Command::new("sudo")
+    let status = Command::new("sudo")
         .arg("-p")
         .arg(SUDO_PROMPT)
         .arg("/bin/sh")
         .arg("-c")
         .arg(script)
-        .output()
+        .status()
         .map_err(|err| format!("could not run sudo: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let reason = stderr
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .last()
-            .unwrap_or("sudo failed");
-        return Err(reason.to_string());
+    if !status.success() {
+        return Err("sudo was cancelled or failed".to_string());
     }
     // Success means the controls now read safe — not merely that sudo exited 0.
     if is_fix_needed() {
