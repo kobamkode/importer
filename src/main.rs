@@ -663,7 +663,7 @@ impl Main {
             .child(
                 div().text_xs()
                     .text_color(rgb(0x556677))
-                    .child("Asks for your sudo password once per boot; the fix lasts until you reboot."),
+                    .child("Uses sudo only when needed, with your usual sudo authentication. The fix lasts until you reboot."),
             )
     }
 

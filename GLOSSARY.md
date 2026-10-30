@@ -29,5 +29,5 @@ User-configured preferences that persist between runs: at minimum the Destinatio
 _Avoid_: preferences, config
 
 **USB power fix**:
-The opt-in Settings choice that, before an Import, temporarily disables kernel USB autosuspend so an idle card reader is not powered down and cannot vanish mid-Import. It asks for the sudo password once per boot, and the change lasts until reboot.
+The opt-in Settings choice that, before an Import, temporarily disables kernel USB autosuspend so an idle card reader is not powered down and cannot vanish mid-Import. It runs with sudo only when the kernel still allows autosuspend, using whatever authentication sudo is configured for, and the change lasts until reboot.
 _Avoid_: USB tweak, power workaround
