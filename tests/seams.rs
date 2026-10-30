@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use importer::{Settings, format_date, import_files, load_settings_from, save_settings_to, taken_date};
+use importer::{
+    DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY, Settings, format_date, import_files,
+    load_settings_from, save_settings_to, taken_date,
+};
 use tempfile::TempDir;
 
 fn fixture(name: &str) -> PathBuf {
@@ -283,7 +286,7 @@ fn same_name_different_content_gets_suffix() {
 /// A Source tree with distinct names and Taken Dates: three JPEGs on
 /// different days plus one video. No collisions, so a run at any concurrency
 /// must land exactly the same files under the same names.
-fn sample_card(dir: &Path) -> Vec<PathBuf> {
+fn sample_source(dir: &Path) -> Vec<PathBuf> {
     std::fs::create_dir_all(dir.join("DCIM/100CANON")).unwrap();
     let files = vec![
         jpeg_with_exif(dir, "IMG_0001.jpg", "2026:10:10 14:32:55"),
@@ -298,8 +301,8 @@ fn sample_card(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn concurrency_1_and_3_produce_the_same_import() {
     let dir = TempDir::new().unwrap();
-    let card = dir.path().join("card");
-    let files = sample_card(&card);
+    let source = dir.path().join("source");
+    let files = sample_source(&source);
 
     let run = |concurrency: usize, root: &str| {
         let settings = Settings {
@@ -327,7 +330,7 @@ fn concurrency_1_and_3_produce_the_same_import() {
             .iter()
             .map(|(src, dest)| {
                 (
-                    src.strip_prefix(&card).unwrap().display().to_string(),
+                    src.strip_prefix(&source).unwrap().display().to_string(),
                     dest.strip_prefix(root).unwrap().display().to_string(),
                 )
             })
@@ -394,7 +397,7 @@ fn colliding_names_both_land_at_concurrency_3() {
 // ---------- failed copy cleanup (importer-tk5.2) ----------
 
 /// A Source that yields a Taken Date (its mtime) but that `std::fs::copy`
-/// cannot read: a directory wearing a media name. It fails *after* the
+/// cannot read: a directory named like a photo. It fails *after* the
 /// Destination name is claimed, which is the path the cleanup must survive.
 fn uncopyable_source(dir: &Path, file_name: &str, mtime: SystemTime) -> PathBuf {
     let path = dir.join(file_name);
@@ -509,7 +512,13 @@ fn file_without_concurrency_loads_3_and_keeps_other_settings() {
 fn out_of_range_or_non_numeric_concurrency_is_clamped_on_load() {
     let dir = TempDir::new().unwrap();
 
-    for (written, expected) in [("0", 1), ("11", 10), ("500", 10), ("many", 3), ("-2", 3)] {
+    for (written, expected) in [
+        ("0", MIN_CONCURRENCY),
+        ("11", MAX_CONCURRENCY),
+        ("500", MAX_CONCURRENCY),
+        ("many", DEFAULT_CONCURRENCY),
+        ("-2", DEFAULT_CONCURRENCY),
+    ] {
         let path = dir.path().join(format!("{written}.conf"));
         std::fs::write(&path, format!("concurrency={written}\n")).unwrap();
         assert_eq!(
