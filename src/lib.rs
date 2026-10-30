@@ -11,6 +11,11 @@ use std::sync::Mutex;
 use chrono::{Datelike, Local, NaiveDateTime, Timelike};
 use nom_exif::{ExifTag, Metadata, TrackInfoTag, read_metadata};
 
+/// Bounds of the parallel-imports stepper, and its fresh-install value.
+pub const MIN_CONCURRENCY: usize = 1;
+pub const MAX_CONCURRENCY: usize = 10;
+pub const DEFAULT_CONCURRENCY: usize = 3;
+
 /// User-configured preferences that drive where and how files are written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -19,6 +24,9 @@ pub struct Settings {
     /// Token format (`YYYYMMDD`, `YYYY-MM-DD`, `YYYYMMDD_HHMMSS`) driving
     /// both the date folder name and the file-name prefix.
     pub date_format: String,
+    /// How many files one Import may copy at once, always within
+    /// [`MIN_CONCURRENCY`]..=[`MAX_CONCURRENCY`].
+    pub concurrency: usize,
 }
 
 impl Default for Settings {
@@ -30,6 +38,7 @@ impl Default for Settings {
         Self {
             dest_root,
             date_format: "YYYYMMDD".to_string(),
+            concurrency: DEFAULT_CONCURRENCY,
         }
     }
 }
@@ -47,9 +56,9 @@ pub struct Report {
 /// Where settings persist: `$XDG_CONFIG_HOME/importer/settings.conf`, falling
 /// back to `~/.config/importer/settings.conf`.
 ///
-/// shortcut: flat `key=value` lines — enough while settings are two strings;
-/// switch to a serialized format (toml + serde) when a setting arrives that
-/// isn't a flat string.
+/// shortcut: flat `key=value` lines, numbers parsed per key — enough while
+/// settings stay flat; switch to a serialized format (toml + serde) when one
+/// arrives that isn't a flat scalar.
 pub fn settings_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -80,6 +89,13 @@ pub fn load_settings_from(path: &Path) -> Settings {
         match key {
             "dest_root" if !value.is_empty() => settings.dest_root = PathBuf::from(value),
             "date_format" if !value.is_empty() => settings.date_format = value.to_string(),
+            // A hand-edited file must not inject 0 or 500; anything that isn't
+            // a number keeps the default.
+            "concurrency" => {
+                if let Ok(n) = value.parse::<usize>() {
+                    settings.concurrency = n.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY);
+                }
+            }
             _ => {} // unknown keys: forward-compatible, ignored
         }
     }
@@ -98,18 +114,25 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> std::io::Result<()>
     std::fs::write(
         path,
         format!(
-            "dest_root={}\ndate_format={}\n",
+            "dest_root={}\ndate_format={}\nconcurrency={}\n",
             settings.dest_root.display(),
-            settings.date_format
+            settings.date_format,
+            settings.concurrency
         ),
     )
 }
 
-/// Build the [`Settings`] to persist from raw settings-form text. Values are
-/// trimmed; a field the user emptied keeps its current value — the flat file
-/// format can't represent an empty value (see [`load_settings_from`]), and an
-/// empty Destination root would scatter the next import into relative folders.
-pub fn settings_from_form(dest_root: &str, date_format: &str, current: &Settings) -> Settings {
+/// Build the [`Settings`] to persist from raw settings-form text plus the
+/// stepper's value. Values are trimmed; a field the user emptied keeps its
+/// current value — the flat file format can't represent an empty value (see
+/// [`load_settings_from`]), and an empty Destination root would scatter the
+/// next import into relative folders.
+pub fn settings_from_form(
+    dest_root: &str,
+    date_format: &str,
+    concurrency: usize,
+    current: &Settings,
+) -> Settings {
     let dest_root = dest_root.trim();
     let date_format = date_format.trim();
     Settings {
@@ -123,6 +146,7 @@ pub fn settings_from_form(dest_root: &str, date_format: &str, current: &Settings
         } else {
             date_format.to_string()
         },
+        concurrency: concurrency.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY),
     }
 }
 

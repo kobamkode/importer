@@ -12,8 +12,8 @@ use gpui::{
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
 use importer::{
-    Outcome, Settings, detect_roots, format_date, import_file, load_settings, save_settings,
-    scan, settings_from_form,
+    MAX_CONCURRENCY, MIN_CONCURRENCY, Outcome, Settings, detect_roots, format_date, import_file,
+    load_settings, save_settings, scan, settings_from_form,
 };
 
 mod field;
@@ -53,6 +53,9 @@ struct Main {
     screen: Screen,
     dest_field: Entity<Field>,
     format_field: Entity<Field>,
+    /// Stepper value while the settings form is open; only Save writes it
+    /// into [`Settings`].
+    concurrency: usize,
     save_error: Option<String>,
 }
 
@@ -61,6 +64,7 @@ impl Main {
         let settings = load_settings();
         let rows = Self::scan_rows();
         Self {
+            concurrency: settings.concurrency,
             settings,
             rows,
             imported: 0,
@@ -217,6 +221,7 @@ impl Main {
         let fmt = self.settings.date_format.clone();
         self.dest_field.update(cx, |field, cx| field.set_text(&dest, cx));
         self.format_field.update(cx, |field, cx| field.set_text(&fmt, cx));
+        self.concurrency = self.settings.concurrency;
         self.save_error = None;
         self.screen = Screen::Settings;
         cx.focus_view(&self.dest_field, window);
@@ -229,7 +234,7 @@ impl Main {
     fn save_settings_view(&mut self, cx: &mut Context<Self>) {
         let dest = self.dest_field.read(cx).text();
         let fmt = self.format_field.read(cx).text();
-        let new = settings_from_form(&dest, &fmt, &self.settings);
+        let new = settings_from_form(&dest, &fmt, self.concurrency, &self.settings);
         match save_settings(&new) {
             Ok(()) => {
                 self.settings = new;
@@ -416,8 +421,9 @@ impl Main {
     }
 
     /// The settings form: two editable fields populated from the persisted
-    /// Settings, a live preview from the core's own formatter, Save/Back.
-    /// Enter inside a field bubbles up here as Commit and saves.
+    /// Settings, the parallel-imports stepper, a live preview from the core's
+    /// own formatter, Save/Back. Enter inside a field bubbles up here as
+    /// Commit and saves.
     fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let dest = self.dest_field.read(cx).text();
         let fmt = self.format_field.read(cx).text();
@@ -460,6 +466,18 @@ impl Main {
                     .py_4()
                     .child(Self::form_row("Destination", self.dest_field.clone()))
                     .child(Self::form_row("Date format", self.format_field.clone()))
+                    .child(Self::form_row(
+                        "Parallel imports",
+                        div().flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(self.stepper(cx))
+                            .child(
+                                div().text_xs()
+                                    .text_color(rgb(0x556677))
+                                    .child("How many files are copied at once — more in flight is not a speed guarantee"),
+                            ),
+                    ))
                     .child(
                         div().flex()
                             .items_start()
@@ -511,9 +529,45 @@ impl Main {
             .into_any_element()
     }
 
-    /// Label-left / control-right row; the field takes the remaining width,
+    /// `− N +` built from the footer pill buttons; stops at the bounds instead
+    /// of wrapping, so 1 and 10 are visible dead ends.
+    fn stepper(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex()
+            .items_center()
+            .gap_3()
+            .child(Self::button(
+                cx,
+                "concurrency-down",
+                "−",
+                0x2a3242,
+                0x3a465e,
+                |this, cx| {
+                    this.concurrency = this.concurrency.saturating_sub(1).max(MIN_CONCURRENCY);
+                    cx.notify();
+                },
+            ))
+            .child(
+                div().w(px(28.))
+                    .text_center()
+                    .text_size(px(15.))
+                    .child(self.concurrency.to_string()),
+            )
+            .child(Self::button(
+                cx,
+                "concurrency-up",
+                "+",
+                0x2a3242,
+                0x3a465e,
+                |this, cx| {
+                    this.concurrency = (this.concurrency + 1).min(MAX_CONCURRENCY);
+                    cx.notify();
+                },
+            ))
+    }
+
+    /// Label-left / control-right row; the control takes the remaining width,
     /// so the form tracks window resizing instead of floating in dead space.
-    fn form_row(label: &'static str, field: Entity<Field>) -> impl IntoElement {
+    fn form_row(label: &'static str, control: impl IntoElement) -> impl IntoElement {
         div().flex()
             .items_center()
             .gap_4()
@@ -524,7 +578,7 @@ impl Main {
                     .text_color(rgb(0x7d8aa0))
                     .child(label),
             )
-            .child(div().flex_1().min_w_0().child(field))
+            .child(div().flex_1().min_w_0().child(control))
     }
 }
 
