@@ -3,7 +3,8 @@
 //! No UI, no gpui — the shell wraps this. Domain terms: see `GLOSSARY.md`.
 //! Test seams live here: [`import_files`] and its per-file form
 //! [`import_file`] (the entry points), and [`taken_date`] (the Taken Date
-//! parser).
+//! parser). The opt-in USB power pre-step is not part of an Import: the shell
+//! runs it through the [`usb`] module before the first file.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
