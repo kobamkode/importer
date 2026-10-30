@@ -1,8 +1,9 @@
 //! Import core: copies media files from a Source into a date-organized Destination.
 //!
 //! No UI, no gpui — the shell wraps this. Domain terms: see `GLOSSARY.md`.
-//! Two test seams live here: [`import_files`] (the core entry point) and
-//! [`taken_date`] (the Taken Date parser).
+//! Test seams live here: [`import_files`] and its per-file form
+//! [`import_file`] (the entry points), and [`taken_date`] (the Taken Date
+//! parser).
 
 use std::path::{Path, PathBuf};
 
@@ -103,6 +104,27 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> std::io::Result<()>
     )
 }
 
+/// Build the [`Settings`] to persist from raw settings-form text. Values are
+/// trimmed; a field the user emptied keeps its current value — the flat file
+/// format can't represent an empty value (see [`load_settings_from`]), and an
+/// empty Destination root would scatter the next import into relative folders.
+pub fn settings_from_form(dest_root: &str, date_format: &str, current: &Settings) -> Settings {
+    let dest_root = dest_root.trim();
+    let date_format = date_format.trim();
+    Settings {
+        dest_root: if dest_root.is_empty() {
+            current.dest_root.clone()
+        } else {
+            PathBuf::from(dest_root)
+        },
+        date_format: if date_format.is_empty() {
+            current.date_format.clone()
+        } else {
+            date_format.to_string()
+        },
+    }
+}
+
 /// The moment a photo or video was captured: EXIF `DateTimeOriginal` (images)
 /// or `CreateDate` (video), falling back to the file's modified-time when the
 /// file carries neither. Returns `None` only when the file can't be read at all.
@@ -163,7 +185,7 @@ pub fn format_date(date: NaiveDateTime, fmt: &str) -> String {
 }
 
 /// Extensions worth importing — JPEG, HEIC, RAW (CR3/NEF/ARW/DNG), MP4/MOV.
-/// Everything else on a card (`.THM`, sidecars, `MISC/`, `._` files) is
+/// Everything else on the Source (`.THM`, sidecars, `MISC/`, `._` files) is
 /// invisible to the importer.
 const MEDIA_EXTENSIONS: [&str; 9] = [
     "jpg", "jpeg", "heic", "cr3", "nef", "arw", "dng", "mp4", "mov",
@@ -189,6 +211,7 @@ pub fn detect_roots() -> Vec<PathBuf> {
 }
 
 /// Recursively find importable files under `roots`, sorted for a stable run.
+/// Directories named `MISC` are not descended into (camera convention).
 /// Symlinked directories are not followed (no cycles off a mount).
 pub fn scan(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -209,10 +232,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         // file_type() does not follow symlinks: symlinked dirs won't be
-        // descended into, which is what keeps cycles off a mounted card.
+        // descended into, which is what keeps cycles off a mounted Source.
         let Ok(file_type) = entry.file_type() else { continue };
         let path = entry.path();
         if file_type.is_dir() {
+            // MISC/ is a camera convention for thumbnails and miscellany, not
+            // media — invisible at any depth (spec US12).
+            if entry.file_name() == "MISC" {
+                continue;
+            }
             walk(&path, out);
         } else if file_type.is_file() && is_media(&path) && !is_junk(&path) {
             out.push(path);
@@ -245,25 +273,31 @@ pub fn import(roots: &[PathBuf], settings: &Settings) -> Report {
 pub fn import_files(files: &[PathBuf], settings: &Settings) -> Report {
     let mut report = Report::default();
     for src in files {
-        match import_one(src, settings) {
+        match import_file(src, settings) {
             Outcome::Imported(dest) => {
                 report.mappings.push((src.clone(), dest));
                 report.imported += 1;
             }
-            Outcome::Skipped => report.skipped += 1,
+            Outcome::Skipped(_) => report.skipped += 1,
             Outcome::Failed => report.failed += 1,
         }
     }
     report
 }
 
-enum Outcome {
+/// What one file did during an import.
+#[derive(Debug)]
+pub enum Outcome {
     Imported(PathBuf),
-    Skipped,
+    /// Identical content already lives at this Destination path.
+    Skipped(PathBuf),
     Failed,
 }
 
-fn import_one(src: &Path, settings: &Settings) -> Outcome {
+/// Import a single file; what happened to it. [`import_files`] is this per
+/// file, tallied into a [`Report`]. The shell calls this directly so each
+/// row can show its own result as it lands.
+pub fn import_file(src: &Path, settings: &Settings) -> Outcome {
     let Some(date) = taken_date(src) else { return Outcome::Failed };
     let stamped = format_date(date, &settings.date_format);
     let Some(name) = src.file_name() else { return Outcome::Failed };
@@ -272,7 +306,7 @@ fn import_one(src: &Path, settings: &Settings) -> Outcome {
 
     // 0 tries the plain name, then -1, -2, … A free slot means this content
     // isn't here yet; an occupied slot with our exact bytes means it already
-    // is (idempotent re-run). Bound the hunt so a pathological card can't
+    // is (idempotent re-run). Bound the hunt so a pathological Source can't
     // spin forever.
     for n in 0..10_000u32 {
         let dest = if n == 0 {
@@ -290,7 +324,7 @@ fn import_one(src: &Path, settings: &Settings) -> Outcome {
             };
         }
         if same_content(src, &dest) {
-            return Outcome::Skipped;
+            return Outcome::Skipped(dest);
         }
     }
     Outcome::Failed

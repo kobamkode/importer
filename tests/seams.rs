@@ -14,6 +14,8 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+// HEIC/RAW fixtures untested: no encoder/sample on this machine — known gap, see importer-cb5 notes
+
 /// Copy a fixture into `dir` and stamp it with a known DateTimeOriginal.
 fn jpeg_with_exif(dir: &Path, file_name: &str, exif_date: &str) -> PathBuf {
     let path = dir.join(file_name);
@@ -151,6 +153,24 @@ fn existing_destination_file_is_not_overwritten() {
 }
 
 #[test]
+fn skipped_file_reports_existing_destination() {
+    let dir = TempDir::new().unwrap();
+    let src = jpeg_with_exif(dir.path(), "IMG_9.jpg", "2026:10:10 14:32:55");
+    let settings = settings_in(&dir, "YYYYMMDD");
+    import_files(&[src.clone()], &settings);
+
+    // US13: the user must be able to verify where every file went — skipped
+    // files report the Destination path that already holds identical content.
+    match importer::import_file(&src, &settings) {
+        importer::Outcome::Skipped(dest) => assert_eq!(
+            dest,
+            settings.dest_root.join("20261010/20261010_IMG_9.jpg")
+        ),
+        other => panic!("expected Skipped(existing destination), got {other:?}"),
+    }
+}
+
+#[test]
 fn identical_content_is_skipped_on_rerun() {
     let dir = TempDir::new().unwrap();
     let src = jpeg_with_exif(dir.path(), "IMG_9.jpg", "2026:10:10 14:32:55");
@@ -194,6 +214,23 @@ fn scan_finds_media_recursively_across_roots_and_skips_junk() {
     // Two roots are random temp dirs; order across them isn't meaningful here.
     names.sort();
     assert_eq!(names, vec!["IMG_0001.JPG", "IMG_0002.heic", "IMG_1000.jpg", "MVI_0003.mp4"]);
+}
+
+#[test]
+fn misc_directory_is_invisible() {
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("DCIM")).unwrap();
+    std::fs::create_dir_all(root.path().join("MISC")).unwrap();
+    std::fs::copy(fixture("base.jpg"), root.path().join("MISC/whatever.jpg")).unwrap();
+    std::fs::copy(fixture("base.jpg"), root.path().join("DCIM/keep.jpg")).unwrap();
+
+    let found = importer::scan(&[root.path().to_path_buf()]);
+
+    assert_eq!(
+        found,
+        vec![root.path().join("DCIM/keep.jpg")],
+        "MISC/ holds non-media per camera convention (US12); DCIM/ is scanned"
+    );
 }
 
 #[test]
@@ -316,6 +353,40 @@ fn settings_file_is_the_single_mechanism() {
     // Empty value rejected at the boundary → default kept.
     assert_eq!(loaded.date_format, "YYYYMMDD");
     assert_eq!(loaded.dest_root, Settings::default().dest_root);
+}
+
+// ---------- settings form input (importer-cb5.6) ----------
+
+#[test]
+fn form_text_builds_settings_with_empty_fallback() {
+    let current = Settings {
+        dest_root: PathBuf::from("/photos/imports"),
+        date_format: "YYYYMMDD".into(),
+    };
+
+    // Non-empty fields are trimmed and used.
+    assert_eq!(
+        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", &current),
+        Settings {
+            dest_root: PathBuf::from("/new/dest"),
+            date_format: "YYYY-MM-DD".into(),
+        }
+    );
+
+    // An emptied field keeps its current value: the flat file can't hold an
+    // empty value, and an empty Destination root would scatter the next
+    // import into relative folders.
+    assert_eq!(
+        importer::settings_from_form("", "", &current),
+        current
+    );
+    assert_eq!(
+        importer::settings_from_form("", "YYYYMMDD_HHMMSS", &current),
+        Settings {
+            dest_root: current.dest_root.clone(),
+            date_format: "YYYYMMDD_HHMMSS".into(),
+        }
+    );
 }
 
 // ---------- format_date, as used by the entry point ----------

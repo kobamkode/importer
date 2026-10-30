@@ -1,14 +1,22 @@
 //! The gpui shell — variant B layout as approved in the prototype
 //! (bd importer-cb5.1 verdict). All import behavior lives in the `importer`
-//! core; this file only wires it up. Settings view arrives with importer-cb5.6.
+//! core; this file only wires it up — import view plus the settings form
+//! (the text-input widget lives in the `field` module).
 
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Render, Task, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, relative,
+    AnyElement, App, Application, Bounds, Context, Entity, KeyBinding, Render, Task,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb,
 };
-use importer::{Report, Settings, detect_roots, import_files, load_settings, scan};
+
+use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
+use importer::{
+    Outcome, Settings, detect_roots, format_date, import_file, load_settings, save_settings,
+    scan, settings_from_form,
+};
+
+mod field;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RowState {
@@ -16,6 +24,13 @@ enum RowState {
     Imported,
     Failed,
     Skipped,
+}
+
+/// Which page the window shows: the import view or the settings form.
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Import,
+    Settings,
 }
 
 struct Row {
@@ -33,20 +48,18 @@ struct Main {
     running: bool,
     cancelled: bool,
     finished: bool,
+    source_lost: bool,
     task: Option<Task<()>>,
+    screen: Screen,
+    dest_field: Entity<Field>,
+    format_field: Entity<Field>,
+    save_error: Option<String>,
 }
 
 impl Main {
-    fn new(_cx: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let settings = load_settings();
-        let rows = scan(&detect_roots())
-            .into_iter()
-            .map(|src| Row {
-                src,
-                dest: None,
-                state: RowState::Pending,
-            })
-            .collect();
+        let rows = Self::scan_rows();
         Self {
             settings,
             rows,
@@ -56,11 +69,19 @@ impl Main {
             running: false,
             cancelled: false,
             finished: false,
+            source_lost: false,
             task: None,
+            screen: Screen::Import,
+            dest_field: cx.new(|cx| Field::new("Destination root", cx)),
+            format_field: cx.new(|cx| Field::new("YYYYMMDD", cx)),
+            save_error: None,
         }
     }
 
     fn status(&self) -> &'static str {
+        if self.source_lost && !self.running {
+            return "source lost — import stopped";
+        }
         match (self.running, self.cancelled, self.finished) {
             (true, false, _) => "importing…",
             (true, true, _) => "cancelling…",
@@ -79,6 +100,25 @@ impl Main {
         })
     }
 
+    /// Every row the run actually handled — skipped and failed rows consumed
+    /// their slot too, so a re-run of already-imported media still reaches
+    /// the total instead of parking at `imported/total`.
+    fn processed(&self) -> usize {
+        self.imported + self.failed + self.skipped
+    }
+
+    /// A fresh scan as pending rows — Launch and Refresh share this.
+    fn scan_rows() -> Vec<Row> {
+        scan(&detect_roots())
+            .into_iter()
+            .map(|src| Row {
+                src,
+                dest: None,
+                state: RowState::Pending,
+            })
+            .collect()
+    }
+
     /// Launch/Refresh: re-detect mounts, re-scan, reset the run. Sync on
     /// purpose — shortcut: a mount with a huge tree will jank the UI thread;
     /// move the scan to the background executor if that ever bites.
@@ -86,14 +126,7 @@ impl Main {
         if self.running {
             return;
         }
-        self.rows = scan(&detect_roots())
-            .into_iter()
-            .map(|src| Row {
-                src,
-                dest: None,
-                state: RowState::Pending,
-            })
-            .collect();
+        self.rows = Self::scan_rows();
         self.reset_run();
         cx.notify();
     }
@@ -104,6 +137,7 @@ impl Main {
         self.skipped = 0;
         self.cancelled = false;
         self.finished = false;
+        self.source_lost = false;
     }
 
     /// Import starts only on click, one file at a time on the background
@@ -131,12 +165,25 @@ impl Main {
                 });
                 let Ok(next) = next else { return };
                 let Some((src, settings)) = next else { break };
-                let report = cx
+                // The Source can vanish mid-run (unmounted/unplugged).
+                // Stop instead of walking the rest of the rows as failures —
+                // remaining rows stay pending and Refresh recovers.
+                if !src.exists() {
+                    this.update(cx, |this, cx| {
+                        this.source_lost = true;
+                        this.running = false;
+                        this.finished = true;
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+                let outcome = cx
                     .background_executor()
-                    .spawn(async move { import_files(&[src], &settings) })
+                    .spawn(async move { import_file(&src, &settings) })
                     .await;
                 let applied = this.update(cx, |this, cx| {
-                    this.apply(i, report);
+                    this.apply(i, outcome);
                     cx.notify();
                 });
                 if applied.is_err() {
@@ -163,18 +210,63 @@ impl Main {
         cx.notify();
     }
 
-    fn apply(&mut self, i: usize, report: Report) {
+    /// Gear: swap to the settings form, fields loaded from the current
+    /// (persisted) Settings.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dest = self.settings.dest_root.to_string_lossy().into_owned();
+        let fmt = self.settings.date_format.clone();
+        self.dest_field.update(cx, |field, cx| field.set_text(&dest, cx));
+        self.format_field.update(cx, |field, cx| field.set_text(&fmt, cx));
+        self.save_error = None;
+        self.screen = Screen::Settings;
+        cx.focus_view(&self.dest_field, window);
+        cx.notify();
+    }
+
+    /// Save button / Enter inside a field: persist, then swap back. The
+    /// in-memory Settings is replaced too, so the next import uses the new
+    /// values without an app restart (`start` reads `self.settings`).
+    fn save_settings_view(&mut self, cx: &mut Context<Self>) {
+        let dest = self.dest_field.read(cx).text();
+        let fmt = self.format_field.read(cx).text();
+        let new = settings_from_form(&dest, &fmt, &self.settings);
+        match save_settings(&new) {
+            Ok(()) => {
+                self.settings = new;
+                self.save_error = None;
+                self.screen = Screen::Import;
+            }
+            Err(err) => self.save_error = Some(format!("could not save settings: {err}")),
+        }
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.save_error = None;
+        self.screen = Screen::Import;
+        cx.notify();
+    }
+
+    /// One file's outcome drives its row directly — no re-derivation from
+    /// Report counts. Skipped rows carry the Destination that already holds
+    /// the content (US13: verify where every file went).
+    fn apply(&mut self, i: usize, outcome: Outcome) {
         let Some(row) = self.rows.get_mut(i) else { return };
-        if report.imported == 1 {
-            row.state = RowState::Imported;
-            row.dest = report.mappings.first().map(|(_, dest)| dest.clone());
-            self.imported += 1;
-        } else if report.failed == 1 {
-            row.state = RowState::Failed;
-            self.failed += 1;
-        } else if report.skipped == 1 {
-            row.state = RowState::Skipped;
-            self.skipped += 1;
+        match outcome {
+            Outcome::Imported(dest) => {
+                row.state = RowState::Imported;
+                row.dest = Some(dest);
+                self.imported += 1;
+            }
+            Outcome::Skipped(dest) => {
+                row.state = RowState::Skipped;
+                row.dest = Some(dest);
+                self.skipped += 1;
+            }
+            Outcome::Failed => {
+                row.state = RowState::Failed;
+                self.failed += 1;
+            }
         }
     }
 
@@ -204,7 +296,7 @@ impl Main {
         let frac = if total == 0 {
             0.0
         } else {
-            self.imported as f32 / total as f32
+            self.processed() as f32 / total as f32
         };
         div().flex()
             .flex_col()
@@ -221,7 +313,7 @@ impl Main {
                             .gap_2()
                             .child(
                                 div().text_2xl()
-                                    .child(format!("{}", self.imported)),
+                                    .child(format!("{}", self.processed())),
                             )
                             .child(
                                 div().text_xl()
@@ -305,7 +397,11 @@ impl Main {
                     RowState::Skipped => (
                         "=",
                         0x7d8aa0,
-                        format!("{}  (already in Destination)", row.src.display()),
+                        format!(
+                            "{}  →  {} (already in Destination)",
+                            row.src.display(),
+                            row.dest.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
+                        ),
                         0x9fb0c3,
                     ),
                 };
@@ -318,10 +414,125 @@ impl Main {
             }))
             .into_any_element()
     }
+
+    /// The settings form: two editable fields populated from the persisted
+    /// Settings, a live preview from the core's own formatter, Save/Back.
+    /// Enter inside a field bubbles up here as Commit and saves.
+    fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let dest = self.dest_field.read(cx).text();
+        let fmt = self.format_field.read(cx).text();
+        let sample = chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
+            .unwrap()
+            .and_hms_opt(14, 32, 55)
+            .unwrap();
+        let stamped = format_date(sample, &fmt);
+        let preview = format!("{dest}/{stamped}/{stamped}_IMG_1234.jpg");
+        // Same three-band skeleton as the main view: header → full-width
+        // body → footer bar with pills. No centered card.
+        div().size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x141a24))
+            .text_color(rgb(0xe6edf3))
+            .on_action(cx.listener(|this, _: &Commit, _, cx| this.save_settings_view(cx)))
+            .child(
+                div().flex()
+                    .items_baseline()
+                    .justify_between()
+                    .px_6()
+                    .py_5()
+                    .child(div().text_2xl().child("Settings"))
+                    .child(
+                        div().text_sm()
+                            .text_color(rgb(0x7d8aa0))
+                            .child("Changes apply to the next import"),
+                    ),
+            )
+            .child(
+                div().id("settings-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .px_6()
+                    .py_4()
+                    .child(Self::form_row("Destination", self.dest_field.clone()))
+                    .child(Self::form_row("Date format", self.format_field.clone()))
+                    .child(
+                        div().flex()
+                            .items_start()
+                            .gap_4()
+                            .child(
+                                div().w(px(220.))
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(rgb(0x7d8aa0))
+                                    .child("Next import will write"),
+                            )
+                            .child(
+                                div().flex_1()
+                                    .min_w_0()
+                                    .px_4()
+                                    .py_3()
+                                    .rounded_md()
+                                    .bg(rgb(0x1a2029))
+                                    .font_family("monospace")
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0x33dd88))
+                                    .truncate()
+                                    .child(preview),
+                            ),
+                    )
+                    .child(
+                        div().text_xs()
+                            .text_color(rgb(0x556677))
+                            .child("Tokens: YYYY year · MM month · DD day · HH:MM:SS time — everything else is literal"),
+                    )
+                    .child(match &self.save_error {
+                        Some(err) => div().text_sm().text_color(rgb(0xff6b6b)).child(err.clone()),
+                        None => div(),
+                    }),
+            )
+            .child(
+                div().flex()
+                    .gap_3()
+                    .items_center()
+                    .px_6()
+                    .py_4()
+                    .child(Self::button(cx, "save", "Save", 0x2f6feb, 0x4f8cff, |t, cx| {
+                        t.save_settings_view(cx)
+                    }))
+                    .child(Self::button(cx, "back", "Back", 0x2a3242, 0x3a465e, |t, cx| {
+                        t.close_settings(cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Label-left / control-right row; the field takes the remaining width,
+    /// so the form tracks window resizing instead of floating in dead space.
+    fn form_row(label: &'static str, field: Entity<Field>) -> impl IntoElement {
+        div().flex()
+            .items_center()
+            .gap_4()
+            .child(
+                div().w(px(220.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(rgb(0x7d8aa0))
+                    .child(label),
+            )
+            .child(div().flex_1().min_w_0().child(field))
+    }
 }
 
 impl Render for Main {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.screen == Screen::Settings {
+            return self.settings_view(cx);
+        }
         let header = self.header();
         let rows_area = self.rows_area();
         div().size_full()
@@ -337,21 +548,66 @@ impl Render for Main {
                     .items_center()
                     .px_6()
                     .py_4()
-                    .child(Self::button(cx, "import", "Import", 0x2f6feb, 0x4f8cff, |t, cx| {
-                        t.start(cx)
-                    }))
-                    .child(Self::button(cx, "cancel", "Cancel", 0x2a3242, 0x3a465e, |t, cx| {
-                        t.cancel(cx)
-                    }))
-                    .child(Self::button(cx, "refresh", "Refresh", 0x2a3242, 0x3a465e, |t, cx| {
-                        t.rescan(cx)
-                    })),
+                    // Running (including cancelling…): Cancel alone; hiding
+                    // Import/Refresh matches what's actually actionable.
+                    .child(if self.running {
+                        Self::button(cx, "cancel", "Cancel", 0x2a3242, 0x3a465e, |t, cx| {
+                            t.cancel(cx)
+                        })
+                        .into_any_element()
+                    } else {
+                        Self::button(cx, "import", "Import", 0x2f6feb, 0x4f8cff, |t, cx| {
+                            t.start(cx)
+                        })
+                        .into_any_element()
+                    })
+                    .child(if self.running {
+                        div().into_any_element()
+                    } else {
+                        Self::button(cx, "refresh", "Refresh", 0x2a3242, 0x3a465e, |t, cx| {
+                            t.rescan(cx)
+                        })
+                        .into_any_element()
+                    })
+                    // Gear, pushed to the right; opens the settings form.
+                    // Hidden while an import runs: settings take effect on
+                    // the next import (cb5.6), so a mid-run save would split
+                    // one run across two destinations.
+                    .child(div().flex_1())
+                    .child(if self.running {
+                        div().into_any_element()
+                    } else {
+                        div().id("settings")
+                            .px_5()
+                            .py_2()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .bg(rgb(0x2a3242))
+                            .text_color(rgb(0xffffff))
+                            .text_size(px(13.))
+                            .hover(move |s| s.bg(rgb(0x3a465e)))
+                            .child("⚙ Settings")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx)
+                            }))
+                            .into_any_element()
+                    }),
             )
+            .into_any_element()
     }
 }
 
+
 fn main() {
     Application::new().run(|cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("cmd-a", SelectAll, None),
+            KeyBinding::new("ctrl-a", SelectAll, None),
+            KeyBinding::new("ctrl-v", Paste, None),
+            KeyBinding::new("enter", Commit, None),
+        ]);
         let bounds = Bounds::centered(None, gpui::size(px(960.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
