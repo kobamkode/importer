@@ -33,6 +33,7 @@ struct Main {
     running: bool,
     cancelled: bool,
     finished: bool,
+    source_lost: bool,
     task: Option<Task<()>>,
 }
 
@@ -56,11 +57,15 @@ impl Main {
             running: false,
             cancelled: false,
             finished: false,
+            source_lost: false,
             task: None,
         }
     }
 
     fn status(&self) -> &'static str {
+        if self.source_lost && !self.running {
+            return "source lost — import stopped";
+        }
         match (self.running, self.cancelled, self.finished) {
             (true, false, _) => "importing…",
             (true, true, _) => "cancelling…",
@@ -77,6 +82,13 @@ impl Main {
                 self.imported, self.failed, self.skipped
             )
         })
+    }
+
+    /// Every row the run actually handled — skipped and failed rows consumed
+    /// their slot too, so a re-run of already-imported media still reaches
+    /// the total instead of parking at `imported/total`.
+    fn processed(&self) -> usize {
+        self.imported + self.failed + self.skipped
     }
 
     /// Launch/Refresh: re-detect mounts, re-scan, reset the run. Sync on
@@ -104,6 +116,7 @@ impl Main {
         self.skipped = 0;
         self.cancelled = false;
         self.finished = false;
+        self.source_lost = false;
     }
 
     /// Import starts only on click, one file at a time on the background
@@ -131,6 +144,19 @@ impl Main {
                 });
                 let Ok(next) = next else { return };
                 let Some((src, settings)) = next else { break };
+                // The Source can vanish mid-run (card unmounted/unplugged).
+                // Stop instead of walking the rest of the rows as failures —
+                // remaining rows stay pending and Refresh recovers.
+                if !src.exists() {
+                    this.update(cx, |this, cx| {
+                        this.source_lost = true;
+                        this.running = false;
+                        this.finished = true;
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
                 let report = cx
                     .background_executor()
                     .spawn(async move { import_files(&[src], &settings) })
@@ -204,7 +230,7 @@ impl Main {
         let frac = if total == 0 {
             0.0
         } else {
-            self.imported as f32 / total as f32
+            self.processed() as f32 / total as f32
         };
         div().flex()
             .flex_col()
@@ -221,7 +247,7 @@ impl Main {
                             .gap_2()
                             .child(
                                 div().text_2xl()
-                                    .child(format!("{}", self.imported)),
+                                    .child(format!("{}", self.processed())),
                             )
                             .child(
                                 div().text_xl()
