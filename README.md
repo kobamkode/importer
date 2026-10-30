@@ -1,6 +1,6 @@
 # Importer
 
-A Linux desktop app (Rust + gpui) that copies photos and videos from a mounted Source into a dated Destination tree. The Source is never modified.
+Copies photos and videos from a mounted card into a dated folder tree. It only reads the card.
 
 ## Run
 
@@ -8,20 +8,21 @@ A Linux desktop app (Rust + gpui) that copies photos and videos from a mounted S
 cargo run --release
 ```
 
-Plug the card or USB drive in, choose a Destination in Settings, then press Import.
+Plug the card in, set the destination folder and date format in Settings, press Import.
 
-## What an Import does
+## What it does
 
-- Finds media under `/run/media/$USER`, `/media/$USER`, and `/mnt`.
-- Copies JPEG, HEIC, RAW (CR3, NEF, ARW, DNG), and MP4/MOV. `MISC/` folders and `._*` sidecars are ignored.
-- Writes each file to `<Destination>/<DATE>/<DATE>_<original name>`.
-- `DATE` comes from the Taken Date: EXIF `DateTimeOriginal`, video `CreateDate`, falling back to the file's modified time. Format tokens: `YYYY`, `MM`, `DD`, `HH`, `SS` (`MM` is month before the first `HH`, minute after).
-- Never overwrites: identical content is skipped, different content gets a `-1` suffix before the extension.
-- Copies up to the concurrency setting (1–10) at once. Each file is independent; one failure does not stop the run.
+It scans `/run/media/<user>`, `/media/<user>` and `/mnt` for JPEG, HEIC, CR3, NEF, ARW, DNG, MP4 and MOV files. Folders named `MISC` and files starting with `._` are ignored.
+
+Each file lands at `<destination>/<date>/<date>_<original name>`. The date is the photo's EXIF `DateTimeOriginal`, the video's `CreateDate`, or the file's modified time when neither is present. Format tokens are `YYYY`, `MM`, `DD`, `HH` and `SS`. `MM` is the month until the first `HH`, then minutes.
+
+Nothing gets overwritten. An identical file is skipped; a different file with the same name gets a `-1` suffix.
+
+Files copy in parallel, 1 to 10 at a time, set in Settings.
 
 ## Settings
 
-Saved at `$XDG_CONFIG_HOME/importer/settings.conf` (default `~/.config/importer/settings.conf`) as flat `key=value` lines:
+Settings are stored in `$XDG_CONFIG_HOME/importer/settings.conf`, or `~/.config/importer/settings.conf` when that variable is unset:
 
 ```ini
 dest_root=/home/you/Pictures/Imports
@@ -30,18 +31,10 @@ concurrency=3
 usb_power_fix=false
 ```
 
-The USB power fix is opt-in. Before an Import it disables kernel USB autosuspend so an idle card reader is not powered down and cannot vanish mid-Import. It runs with sudo only when the kernel still allows autosuspend, uses your usual sudo authentication, and lasts until reboot.
+The USB power fix is off by default. When on, it disables USB autosuspend before each import so an idle card reader does not drop off mid-copy. It runs only when needed, uses whatever authentication sudo is set up for, and lasts until reboot.
 
 ## Develop
 
 ```bash
-cargo test   # core and integration tests, no GUI needed
-cargo run
+cargo test
 ```
-
-- `src/lib.rs` — core: scan, Taken Date, naming, copy, settings
-- `src/main.rs` — gpui shell: Import view and Settings form
-- `src/usb.rs` — USB power fix
-- `src/field.rs` — single-line text input
-- `tests/seams.rs` — integration tests through the core seams
-- `GLOSSARY.md` — domain terms; `AGENTS.md` — repo conventions
