@@ -505,15 +505,27 @@ impl Render for Main {
                     .items_center()
                     .px_6()
                     .py_4()
-                    .child(Self::button(cx, "import", "Import", 0x2f6feb, 0x4f8cff, |t, cx| {
-                        t.start(cx)
-                    }))
-                    .child(Self::button(cx, "cancel", "Cancel", 0x2a3242, 0x3a465e, |t, cx| {
-                        t.cancel(cx)
-                    }))
-                    .child(Self::button(cx, "refresh", "Refresh", 0x2a3242, 0x3a465e, |t, cx| {
-                        t.rescan(cx)
-                    }))
+                    // Running (including cancelling…): Cancel alone; hiding
+                    // Import/Refresh matches what's actually actionable.
+                    .child(if self.running {
+                        Self::button(cx, "cancel", "Cancel", 0x2a3242, 0x3a465e, |t, cx| {
+                            t.cancel(cx)
+                        })
+                        .into_any_element()
+                    } else {
+                        Self::button(cx, "import", "Import", 0x2f6feb, 0x4f8cff, |t, cx| {
+                            t.start(cx)
+                        })
+                        .into_any_element()
+                    })
+                    .child(if self.running {
+                        div().into_any_element()
+                    } else {
+                        Self::button(cx, "refresh", "Refresh", 0x2a3242, 0x3a465e, |t, cx| {
+                            t.rescan(cx)
+                        })
+                        .into_any_element()
+                    })
                     // Gear, pushed to the right; opens the settings form.
                     .child(div().flex_1())
                     .child(
