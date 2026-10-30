@@ -4,6 +4,7 @@
 //! (the text-input widget lives in the `field` module).
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, KeyBinding, Render, Task,
@@ -49,6 +50,10 @@ struct Main {
     cancelled: bool,
     finished: bool,
     source_lost: bool,
+    /// When the first file of this run launched; `None` outside a run.
+    started_at: Option<Instant>,
+    /// This run's duration, frozen when it ends so the summary stops moving.
+    elapsed: Option<Duration>,
     task: Option<Task<()>>,
     screen: Screen,
     dest_field: Entity<Field>,
@@ -74,6 +79,8 @@ impl Main {
             cancelled: false,
             finished: false,
             source_lost: false,
+            started_at: None,
+            elapsed: None,
             task: None,
             screen: Screen::Import,
             dest_field: cx.new(|cx| Field::new("Destination root", cx)),
@@ -97,10 +104,15 @@ impl Main {
 
     fn summary(&self) -> Option<String> {
         (!self.running && self.finished).then(|| {
-            format!(
+            let mut summary = format!(
                 "{} imported · {} failed · {} skipped",
                 self.imported, self.failed, self.skipped
-            )
+            );
+            // Only runs that launched at least one file have a duration.
+            if let Some(elapsed) = self.elapsed {
+                summary.push_str(&format!(" · took {:.1}s", elapsed.as_secs_f64()));
+            }
+            summary
         })
     }
 
@@ -142,10 +154,16 @@ impl Main {
         self.cancelled = false;
         self.finished = false;
         self.source_lost = false;
+        self.started_at = None;
+        self.elapsed = None;
     }
 
-    /// Import starts only on click, one file at a time on the background
-    /// executor so the window keeps painting; each completion repaints its row.
+    /// Import starts only on click. Files launch in windows of
+    /// `Settings.concurrency` on the background executor and the next window
+    /// waits for the previous one to drain, so no more than N copies run at
+    /// once. Each row paints its own outcome as it lands (out of order is
+    /// fine); counts and the bar are derived from row outcomes. At 1 this is
+    /// one window per file, today's loop.
     fn start(&mut self, cx: &mut Context<Self>) {
         if self.running || self.rows.is_empty() {
             return;
@@ -158,45 +176,67 @@ impl Main {
         self.running = true;
         let total = self.rows.len();
         self.task = Some(cx.spawn(async move |this, cx| {
-            for i in 0..total {
-                let next = this.update(cx, |this, _| {
+            let mut next = 0;
+            while next < total {
+                // Take the next window, or break: cancelled, or Source gone.
+                let window = this.update(cx, |this, _| {
                     if this.cancelled {
                         return None;
                     }
-                    this.rows
-                        .get(i)
-                        .map(|row| (row.src.clone(), this.settings.clone()))
-                });
-                let Ok(next) = next else { return };
-                let Some((src, settings)) = next else { break };
-                // The Source can vanish mid-run (unmounted/unplugged).
-                // Stop instead of walking the rest of the rows as failures —
-                // remaining rows stay pending and Refresh recovers.
-                if !src.exists() {
-                    this.update(cx, |this, cx| {
+                    // One existence check per window (see the ticket): files
+                    // already copying when the Source vanishes fail on their
+                    // own, and this check stops the run before the next
+                    // window, leaving its rows pending.
+                    if !this.rows.get(next).is_some_and(|row| row.src.exists()) {
                         this.source_lost = true;
-                        this.running = false;
-                        this.finished = true;
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-                let outcome = cx
-                    .background_executor()
-                    .spawn(async move { import_file(&src, &settings) })
-                    .await;
-                let applied = this.update(cx, |this, cx| {
-                    this.apply(i, outcome);
-                    cx.notify();
+                        return None;
+                    }
+                    let size = this
+                        .settings
+                        .concurrency
+                        .clamp(MIN_CONCURRENCY, MAX_CONCURRENCY);
+                    let end = (next + size).min(total);
+                    // The clock starts with the first launch, so any wait
+                    // before the copy loop is excluded.
+                    this.started_at.get_or_insert_with(Instant::now);
+                    Some(
+                        (next..end)
+                            .filter_map(|i| {
+                                this.rows
+                                    .get(i)
+                                    .map(|row| (i, row.src.clone(), this.settings.clone()))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 });
-                if applied.is_err() {
-                    return;
+                let Ok(window) = window else { return };
+                let Some(window) = window else { break };
+                next += window.len();
+                let mut launches = Vec::with_capacity(window.len());
+                for (i, src, settings) in window {
+                    // Separate task per row so a fast file paints its row
+                    // without waiting for the slowest one in the window.
+                    let this = this.clone();
+                    launches.push(cx.spawn(async move |cx| {
+                        let outcome = cx
+                            .background_executor()
+                            .spawn(async move { import_file(&src, &settings) })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.apply(i, outcome);
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                }
+                for launch in launches {
+                    launch.await;
                 }
             }
             this.update(cx, |this, cx| {
                 this.running = false;
                 this.finished = true;
+                this.elapsed = this.started_at.take().map(|started| started.elapsed());
                 cx.notify();
             })
             .ok();
@@ -204,8 +244,9 @@ impl Main {
         cx.notify();
     }
 
-    /// Flag-based cancel: the current file finishes (never a partial copy at
-    /// the Destination), the loop stops before the next one.
+    /// Flag-based cancel: the in-flight window finishes (never a partial copy
+    /// at the Destination), no new window starts, and the status stays
+    /// "cancelling…" until those files drain.
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if !self.running || self.cancelled {
             return;

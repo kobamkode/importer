@@ -278,6 +278,119 @@ fn same_name_different_content_gets_suffix() {
     assert!(d.join("20261010_IMG_1-1.jpg").exists());
 }
 
+// ---------- parallel imports (importer-tk5.3) ----------
+
+/// A Source tree with distinct names and Taken Dates: three JPEGs on
+/// different days plus one video. No collisions, so a run at any concurrency
+/// must land exactly the same files under the same names.
+fn sample_card(dir: &Path) -> Vec<PathBuf> {
+    std::fs::create_dir_all(dir.join("DCIM/100CANON")).unwrap();
+    let files = vec![
+        jpeg_with_exif(dir, "IMG_0001.jpg", "2026:10:10 14:32:55"),
+        jpeg_with_exif(dir, "IMG_0002.jpg", "2026:10:11 08:00:00"),
+        jpeg_with_exif(dir, "IMG_0003.jpg", "2026:10:12 09:30:00"),
+    ];
+    let clip = dir.join("DCIM/100CANON/MVI_0004.mp4");
+    std::fs::copy(fixture("clip.mp4"), &clip).unwrap();
+    files.into_iter().chain([clip]).collect()
+}
+
+#[test]
+fn concurrency_1_and_3_produce_the_same_import() {
+    let dir = TempDir::new().unwrap();
+    let card = dir.path().join("card");
+    let files = sample_card(&card);
+
+    let run = |concurrency: usize, root: &str| {
+        let settings = Settings {
+            dest_root: dir.path().join(root),
+            date_format: "YYYYMMDD".into(),
+            concurrency,
+        };
+        let report = import_files(&files, &settings);
+        (settings.dest_root, report)
+    };
+    let (one_root, one) = run(1, "dest-one");
+    let (three_root, three) = run(3, "dest-three");
+
+    assert_eq!(one.imported, files.len(), "every file lands one at a time");
+    assert_eq!(
+        (three.imported, three.failed, three.skipped),
+        (one.imported, one.failed, one.skipped),
+        "the same inputs report the same counts at 1 and 3"
+    );
+
+    // Destinations as paths relative to their root, so the two runs compare.
+    let destinations = |report: &importer::Report, root: &Path| -> Vec<(String, String)> {
+        report
+            .mappings
+            .iter()
+            .map(|(src, dest)| {
+                (
+                    src.strip_prefix(&card).unwrap().display().to_string(),
+                    dest.strip_prefix(root).unwrap().display().to_string(),
+                )
+            })
+            .collect()
+    };
+    let one_map = destinations(&one, &one_root);
+    let three_map = destinations(&three, &three_root);
+    assert_eq!(
+        one_map, three_map,
+        "same Sources map to the same Destination paths at 1 and 3"
+    );
+    for (_, dest) in &one_map {
+        assert_eq!(
+            std::fs::read(one_root.join(dest)).unwrap(),
+            std::fs::read(three_root.join(dest)).unwrap(),
+            "Destination bytes must not depend on concurrency: {dest}"
+        );
+    }
+}
+
+#[test]
+fn colliding_names_both_land_at_concurrency_3() {
+    let dir = TempDir::new().unwrap();
+    // Two different files, same file name, same Taken Date → same Destination
+    // name. At 3 they are claimed in the same window, which is the contention
+    // the reservation lock must survive: both land, neither clobbered.
+    let jpeg = jpeg_with_exif(dir.path(), "IMG_1.jpg", "2026:10:10 14:32:55");
+    let video = dir.path().join("other").join("IMG_1.jpg");
+    std::fs::create_dir_all(video.parent().unwrap()).unwrap();
+    std::fs::copy(fixture("clip.mp4"), &video).unwrap();
+    let settings = Settings {
+        concurrency: 3,
+        ..settings_in(&dir, "YYYYMMDD")
+    };
+
+    let report = import_files(&[jpeg.clone(), video.clone()], &settings);
+
+    assert_eq!(report.imported, 2, "both land, neither overwritten");
+    assert_eq!(report.failed, 0);
+    let date_dir = settings.dest_root.join("20261010");
+    let mut names: Vec<String> = std::fs::read_dir(&date_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["20261010_IMG_1-1.jpg", "20261010_IMG_1.jpg"],
+        "one plain name and one suffix, nothing else"
+    );
+    let mut landed: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(date_dir.join(name)).unwrap())
+        .collect();
+    let mut sources = vec![
+        std::fs::read(&jpeg).unwrap(),
+        std::fs::read(&video).unwrap(),
+    ];
+    landed.sort();
+    sources.sort();
+    assert_eq!(landed, sources, "both files land byte-for-byte intact");
+}
+
 // ---------- failed copy cleanup (importer-tk5.2) ----------
 
 /// A Source that yields a Taken Date (its mtime) but that `std::fs::copy`
@@ -327,7 +440,11 @@ fn file_after_failed_copy_gets_plain_name() {
         .unwrap()
         .set_modified(mtime)
         .unwrap();
-    let settings = settings_in(&dir, "YYYYMMDD");
+    // Sequential on purpose: "after a failed copy" is a guarantee about the
+    // order files are launched in. In one parallel window the good file may
+    // claim its name while the broken one still holds the plain name.
+    let mut settings = settings_in(&dir, "YYYYMMDD");
+    settings.concurrency = 1;
     let stamped = format_date(taken_date(&broken).unwrap(), &settings.date_format);
 
     let report = import_files(&[broken, good.clone()], &settings);
@@ -409,7 +526,7 @@ fn missing_settings_file_yields_defaults_through_entry_point() {
     let mut settings = load_settings_from(&dir.path().join("nope.conf"));
     assert_eq!(settings, Settings::default());
     assert_eq!(settings.date_format, "YYYYMMDD");
-    assert_eq!(settings.concurrency, 3, "fresh install copies files in parallel");
+    assert_eq!(settings.concurrency, 3, "fresh install defaults to 3 files at once");
     assert!(
         settings.dest_root.ends_with("Pictures/Imports"),
         "default dest is under HOME: {}",
