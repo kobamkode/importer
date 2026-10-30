@@ -230,6 +230,9 @@ impl Render for Field {
         div().flex()
             .key_context("settings_field")
             .track_focus(&self.focus_handle(cx))
+            // Focus feedback: without this the field gives no visual
+            // response to a click and feels dead.
+            .focus(|s| s.border_color(rgb(0x4f8cff)).bg(rgb(0x1a2029)))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))

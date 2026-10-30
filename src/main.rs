@@ -427,38 +427,61 @@ impl Main {
             .unwrap();
         let stamped = format_date(sample, &fmt);
         let preview = format!("{dest}/{stamped}/{stamped}_IMG_1234.jpg");
-        div().flex_1()
-            .min_h_0()
+        // Same three-band skeleton as the main view: header → full-width
+        // body → footer bar with pills. No centered card.
+        div().size_full()
             .flex()
             .flex_col()
-            .items_center()
+            .bg(rgb(0x141a24))
+            .text_color(rgb(0xe6edf3))
             .on_action(cx.listener(|this, _: &Commit, _, cx| this.save_settings_view(cx)))
             .child(
-                div().w(px(520.))
+                div().flex()
+                    .items_baseline()
+                    .justify_between()
+                    .px_6()
+                    .py_5()
+                    .child(div().text_2xl().child("Settings"))
+                    .child(
+                        div().text_sm()
+                            .text_color(rgb(0x7d8aa0))
+                            .child("Changes apply to the next import"),
+                    ),
+            )
+            .child(
+                div().id("settings-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_5()
-                    .pt(px(48.))
-                    .child(div().text_xl().child("Settings"))
-                    .child(Self::form_field("Destination", self.dest_field.clone()))
-                    .child(Self::form_field("Date format", self.format_field.clone()))
+                    .px_6()
+                    .py_4()
+                    .child(Self::form_row("Destination", self.dest_field.clone()))
+                    .child(Self::form_row("Date format", self.format_field.clone()))
                     .child(
                         div().flex()
-                            .flex_col()
-                            .gap_1()
+                            .items_start()
+                            .gap_4()
                             .child(
-                                div().text_sm()
+                                div().w(px(220.))
+                                    .flex_shrink_0()
+                                    .text_sm()
                                     .text_color(rgb(0x7d8aa0))
                                     .child("Next import will write"),
                             )
                             .child(
-                                div().px_4()
+                                div().flex_1()
+                                    .min_w_0()
+                                    .px_4()
                                     .py_3()
                                     .rounded_md()
                                     .bg(rgb(0x1a2029))
                                     .font_family("monospace")
                                     .text_size(px(12.))
                                     .text_color(rgb(0x33dd88))
+                                    .truncate()
                                     .child(preview),
                             ),
                     )
@@ -470,27 +493,38 @@ impl Main {
                     .child(match &self.save_error {
                         Some(err) => div().text_sm().text_color(rgb(0xff6b6b)).child(err.clone()),
                         None => div(),
-                    })
-                    .child(
-                        div().flex()
-                            .gap_3()
-                            .child(Self::button(cx, "save", "Save", 0x2f6feb, 0x4f8cff, |t, cx| {
-                                t.save_settings_view(cx)
-                            }))
-                            .child(Self::button(cx, "back", "Back", 0x2a3242, 0x3a465e, |t, cx| {
-                                t.close_settings(cx)
-                            })),
-                    ),
+                    }),
+            )
+            .child(
+                div().flex()
+                    .gap_3()
+                    .items_center()
+                    .px_6()
+                    .py_4()
+                    .child(Self::button(cx, "save", "Save", 0x2f6feb, 0x4f8cff, |t, cx| {
+                        t.save_settings_view(cx)
+                    }))
+                    .child(Self::button(cx, "back", "Back", 0x2a3242, 0x3a465e, |t, cx| {
+                        t.close_settings(cx)
+                    })),
             )
             .into_any_element()
     }
 
-    fn form_field(label: &'static str, field: Entity<Field>) -> impl IntoElement {
+    /// Label-left / control-right row; the field takes the remaining width,
+    /// so the form tracks window resizing instead of floating in dead space.
+    fn form_row(label: &'static str, field: Entity<Field>) -> impl IntoElement {
         div().flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_sm().text_color(rgb(0x7d8aa0)).child(label))
-            .child(field)
+            .items_center()
+            .gap_4()
+            .child(
+                div().w(px(220.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(rgb(0x7d8aa0))
+                    .child(label),
+            )
+            .child(div().flex_1().min_w_0().child(field))
     }
 }
 
