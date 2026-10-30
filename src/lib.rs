@@ -103,6 +103,27 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> std::io::Result<()>
     )
 }
 
+/// Build the [`Settings`] to persist from raw settings-form text. Values are
+/// trimmed; a field the user emptied keeps its current value — the flat file
+/// format can't represent an empty value (see [`load_settings_from`]), and an
+/// empty Destination root would scatter the next import into relative folders.
+pub fn settings_from_form(dest_root: &str, date_format: &str, current: &Settings) -> Settings {
+    let dest_root = dest_root.trim();
+    let date_format = date_format.trim();
+    Settings {
+        dest_root: if dest_root.is_empty() {
+            current.dest_root.clone()
+        } else {
+            PathBuf::from(dest_root)
+        },
+        date_format: if date_format.is_empty() {
+            current.date_format.clone()
+        } else {
+            date_format.to_string()
+        },
+    }
+}
+
 /// The moment a photo or video was captured: EXIF `DateTimeOriginal` (images)
 /// or `CreateDate` (video), falling back to the file's modified-time when the
 /// file carries neither. Returns `None` only when the file can't be read at all.

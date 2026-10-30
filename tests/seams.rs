@@ -318,6 +318,40 @@ fn settings_file_is_the_single_mechanism() {
     assert_eq!(loaded.dest_root, Settings::default().dest_root);
 }
 
+// ---------- settings form input (importer-cb5.6) ----------
+
+#[test]
+fn form_text_builds_settings_with_empty_fallback() {
+    let current = Settings {
+        dest_root: PathBuf::from("/photos/imports"),
+        date_format: "YYYYMMDD".into(),
+    };
+
+    // Non-empty fields are trimmed and used.
+    assert_eq!(
+        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", &current),
+        Settings {
+            dest_root: PathBuf::from("/new/dest"),
+            date_format: "YYYY-MM-DD".into(),
+        }
+    );
+
+    // An emptied field keeps its current value: the flat file can't hold an
+    // empty value, and an empty Destination root would scatter the next
+    // import into relative folders.
+    assert_eq!(
+        importer::settings_from_form("", "", &current),
+        current
+    );
+    assert_eq!(
+        importer::settings_from_form("", "YYYYMMDD_HHMMSS", &current),
+        Settings {
+            dest_root: current.dest_root.clone(),
+            date_format: "YYYYMMDD_HHMMSS".into(),
+        }
+    );
+}
+
 // ---------- format_date, as used by the entry point ----------
 
 #[test]
