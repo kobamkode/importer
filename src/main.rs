@@ -1,14 +1,23 @@
 //! The gpui shell — variant B layout as approved in the prototype
 //! (bd importer-cb5.1 verdict). All import behavior lives in the `importer`
-//! core; this file only wires it up. Settings view arrives with importer-cb5.6.
+//! core; this file only wires it up — import view plus the settings form.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Render, Task, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, relative,
+    actions, AnyElement, App, Application, Bounds, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Render, ShapedLine,
+    SharedString, Style, Task, TextRun, TitlebarOptions, UTF16Selection, Window, WindowBounds,
+    WindowOptions, div, fill, hsla, prelude::*, px, point, relative, rgb, rgba, size,
 };
-use importer::{Report, Settings, detect_roots, import_files, load_settings, scan};
+use importer::{
+    Report, Settings, detect_roots, format_date, import_files, load_settings, save_settings, scan,
+    settings_from_form,
+};
+
+actions!(settings_field, [Backspace, Delete, SelectAll, Paste, Commit]);
 
 #[derive(Clone, Copy, PartialEq)]
 enum RowState {
@@ -16,6 +25,13 @@ enum RowState {
     Imported,
     Failed,
     Skipped,
+}
+
+/// Which page the window shows: the import view or the settings form.
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Import,
+    Settings,
 }
 
 struct Row {
@@ -35,10 +51,14 @@ struct Main {
     finished: bool,
     source_lost: bool,
     task: Option<Task<()>>,
+    screen: Screen,
+    dest_field: Entity<Field>,
+    format_field: Entity<Field>,
+    save_error: Option<String>,
 }
 
 impl Main {
-    fn new(_cx: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let settings = load_settings();
         let rows = scan(&detect_roots())
             .into_iter()
@@ -59,6 +79,10 @@ impl Main {
             finished: false,
             source_lost: false,
             task: None,
+            screen: Screen::Import,
+            dest_field: cx.new(|cx| Field::new("Destination root", cx)),
+            format_field: cx.new(|cx| Field::new("YYYYMMDD", cx)),
+            save_error: None,
         }
     }
 
@@ -186,6 +210,43 @@ impl Main {
             return;
         }
         self.cancelled = true;
+        cx.notify();
+    }
+
+    /// Gear: swap to the settings form, fields loaded from the current
+    /// (persisted) Settings.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dest = self.settings.dest_root.to_string_lossy().into_owned();
+        let fmt = self.settings.date_format.clone();
+        self.dest_field.update(cx, |field, cx| field.set_text(&dest, cx));
+        self.format_field.update(cx, |field, cx| field.set_text(&fmt, cx));
+        self.save_error = None;
+        self.screen = Screen::Settings;
+        cx.focus_view(&self.dest_field, window);
+        cx.notify();
+    }
+
+    /// Save button / Enter inside a field: persist, then swap back. The
+    /// in-memory Settings is replaced too, so the next import uses the new
+    /// values without an app restart (`start` reads `self.settings`).
+    fn save_settings_view(&mut self, cx: &mut Context<Self>) {
+        let dest = self.dest_field.read(cx).text();
+        let fmt = self.format_field.read(cx).text();
+        let new = settings_from_form(&dest, &fmt, &self.settings);
+        match save_settings(&new) {
+            Ok(()) => {
+                self.settings = new;
+                self.save_error = None;
+                self.screen = Screen::Import;
+            }
+            Err(err) => self.save_error = Some(format!("could not save settings: {err}")),
+        }
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.save_error = None;
+        self.screen = Screen::Import;
         cx.notify();
     }
 
@@ -344,10 +405,91 @@ impl Main {
             }))
             .into_any_element()
     }
+
+    /// The settings form: two editable fields populated from the persisted
+    /// Settings, a live preview from the core's own formatter, Save/Back.
+    /// Enter inside a field bubbles up here as Commit and saves.
+    fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let dest = self.dest_field.read(cx).text();
+        let fmt = self.format_field.read(cx).text();
+        let sample = chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
+            .unwrap()
+            .and_hms_opt(14, 32, 55)
+            .unwrap();
+        let stamped = format_date(sample, &fmt);
+        let preview = format!("{dest}/{stamped}/{stamped}_IMG_1234.jpg");
+        div().flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .on_action(cx.listener(|this, _: &Commit, _, cx| this.save_settings_view(cx)))
+            .child(
+                div().w(px(520.))
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .pt(px(48.))
+                    .child(div().text_xl().child("Settings"))
+                    .child(Self::form_field("Destination", self.dest_field.clone()))
+                    .child(Self::form_field("Date format", self.format_field.clone()))
+                    .child(
+                        div().flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div().text_sm()
+                                    .text_color(rgb(0x7d8aa0))
+                                    .child("Next import will write"),
+                            )
+                            .child(
+                                div().px_4()
+                                    .py_3()
+                                    .rounded_md()
+                                    .bg(rgb(0x1a2029))
+                                    .font_family("monospace")
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0x33dd88))
+                                    .child(preview),
+                            ),
+                    )
+                    .child(
+                        div().text_xs()
+                            .text_color(rgb(0x556677))
+                            .child("Tokens: YYYY year · MM month · DD day · HH:MM:SS time — everything else is literal"),
+                    )
+                    .child(match &self.save_error {
+                        Some(err) => div().text_sm().text_color(rgb(0xff6b6b)).child(err.clone()),
+                        None => div(),
+                    })
+                    .child(
+                        div().flex()
+                            .gap_3()
+                            .child(Self::button(cx, "save", "Save", 0x2f6feb, 0x4f8cff, |t, cx| {
+                                t.save_settings_view(cx)
+                            }))
+                            .child(Self::button(cx, "back", "Back", 0x2a3242, 0x3a465e, |t, cx| {
+                                t.close_settings(cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn form_field(label: &'static str, field: Entity<Field>) -> impl IntoElement {
+        div().flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_sm().text_color(rgb(0x7d8aa0)).child(label))
+            .child(field)
+    }
 }
 
 impl Render for Main {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.screen == Screen::Settings {
+            return self.settings_view(cx);
+        }
         let header = self.header();
         let rows_area = self.rows_area();
         div().size_full()
@@ -371,13 +513,420 @@ impl Render for Main {
                     }))
                     .child(Self::button(cx, "refresh", "Refresh", 0x2a3242, 0x3a465e, |t, cx| {
                         t.rescan(cx)
-                    })),
+                    }))
+                    // Gear, pushed to the right; opens the settings form.
+                    .child(div().flex_1())
+                    .child(
+                        div().id("settings")
+                            .px_5()
+                            .py_2()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .bg(rgb(0x2a3242))
+                            .text_color(rgb(0xffffff))
+                            .text_size(px(13.))
+                            .hover(move |s| s.bg(rgb(0x3a465e)))
+                            .child("⚙ Settings")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx)
+                            })),
+                    ),
             )
+            .into_any_element()
+    }
+}
+
+// ---------- settings text field ----------
+// Minimal single-line text input, stripped down from gpui's own
+// examples/input.rs (gpui, MIT/Apache-2.0): focus, typing, backspace, delete,
+// select-all, paste; the settings form catches Enter as Commit.
+// shortcut: no arrow-key cursor movement or mouse selection — the cursor only
+// sits at the typing end (backspace walks it back, cmd/ctrl-a replaces all);
+// backspace/delete move one char, not one grapheme (no unicode-segmentation
+// dep). Add any of these when mid-string edits actually bite.
+
+struct Field {
+    focus_handle: FocusHandle,
+    content: SharedString,
+    placeholder: &'static str,
+    selected_range: Range<usize>,
+}
+
+impl Field {
+    fn new(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            content: "".into(),
+            placeholder,
+            selected_range: 0..0,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.content.to_string()
+    }
+
+    fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.content = text.to_string().into();
+        self.selected_range = self.content.len()..self.content.len();
+        cx.notify();
+    }
+
+    fn cursor_offset(&self) -> usize {
+        self.selected_range.end
+    }
+
+    fn previous_boundary(&self, offset: usize) -> usize {
+        self.content
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .rev()
+            .find(|idx| *idx < offset)
+            .unwrap_or(0)
+    }
+
+    fn next_boundary(&self, offset: usize) -> usize {
+        self.content
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .find(|idx| *idx > offset)
+            .unwrap_or(self.content.len())
+    }
+
+    // The platform speaks UTF-16 offsets; content is indexed in bytes.
+    fn offset_from_utf16(&self, offset: usize) -> usize {
+        let mut utf8_offset = 0;
+        let mut utf16_count = 0;
+        for ch in self.content.chars() {
+            if utf16_count >= offset {
+                break;
+            }
+            utf16_count += ch.len_utf16();
+            utf8_offset += ch.len_utf8();
+        }
+        utf8_offset
+    }
+
+    fn offset_to_utf16(&self, offset: usize) -> usize {
+        let mut utf16_offset = 0;
+        let mut utf8_count = 0;
+        for ch in self.content.chars() {
+            if utf8_count >= offset {
+                break;
+            }
+            utf8_count += ch.len_utf8();
+            utf16_offset += ch.len_utf16();
+        }
+        utf16_offset
+    }
+
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+    }
+
+    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let start = self.previous_boundary(self.cursor_offset());
+            self.selected_range = start..self.cursor_offset();
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let end = self.next_boundary(self.cursor_offset());
+            self.selected_range = self.cursor_offset()..end;
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        cx.notify();
+    }
+
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_text_in_range(None, &text, window, cx)
+        }
+    }
+
+    fn on_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+}
+
+impl EntityInputHandler for Field {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.range_from_utf16(&range_utf16);
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.content[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&self.selected_range),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .unwrap_or_else(|| self.selected_range.clone());
+        // Single-line: a newline would corrupt the flat key=value settings file.
+        let new_text = new_text.replace(['\n', '\r'], "");
+        self.content = (self.content[0..range.start].to_owned()
+            + &new_text
+            + &self.content[range.end..])
+            .into();
+        let cursor = range.start + new_text.len();
+        self.selected_range = cursor..cursor;
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // No IME marked text: treat as a plain replacement.
+        self.replace_text_in_range(range_utf16, new_text, window, cx)
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None // no IME candidate window
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None // no click-to-position
+    }
+}
+
+impl Focusable for Field {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for Field {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex()
+            .key_context("settings_field")
+            .track_focus(&self.focus_handle(cx))
+            .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::paste))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .w_full()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .bg(rgb(0x232b3a))
+            .border_1()
+            .border_color(rgb(0x333d4f))
+            .text_size(px(13.))
+            .child(FieldText { field: cx.entity() })
+    }
+}
+
+/// Paints the field's text, placeholder and cursor, and registers the field
+/// as the window's input handler for its bounds. Companion element to
+/// [`Field`] (same provenance: gpui examples/input.rs).
+struct FieldText {
+    field: Entity<Field>,
+}
+
+struct FieldPrepaint {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl IntoElement for FieldText {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for FieldText {
+    type RequestLayoutState = ();
+    type PrepaintState = FieldPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let field = self.field.read(cx);
+        let content = field.content.clone();
+        let cursor = field.cursor_offset();
+        let style = window.text_style();
+        let (display_text, text_color) = if content.is_empty() {
+            (SharedString::from(field.placeholder), hsla(0., 0., 1., 0.25))
+        } else {
+            (content, style.color)
+        };
+        let run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &[run], None);
+        let cursor_pos = line.x_for_index(cursor);
+        let (selection, cursor) = if field.selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_pos, bounds.top()),
+                        size(px(2.), bounds.bottom() - bounds.top()),
+                    ),
+                    rgb(0x4f8cff),
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left() + line.x_for_index(field.selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(field.selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    rgba(0x4f8cff50),
+                )),
+                None,
+            )
+        };
+        FieldPrepaint {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.field.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.field.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection)
+        }
+        let line = prepaint.line.take().unwrap();
+        line.paint(bounds.origin, window.line_height(), window, cx)
+            .ok();
+        if focus_handle.is_focused(window) {
+            if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
+        }
     }
 }
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("cmd-a", SelectAll, None),
+            KeyBinding::new("ctrl-a", SelectAll, None),
+            KeyBinding::new("ctrl-v", Paste, None),
+            KeyBinding::new("enter", Commit, None),
+        ]);
         let bounds = Bounds::centered(None, gpui::size(px(960.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
