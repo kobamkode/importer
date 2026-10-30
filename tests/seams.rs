@@ -495,6 +495,17 @@ fn settings_round_trip() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("concurrency=7"), "saved file: {text}");
     assert!(text.contains("usb_power_fix=true"), "saved file: {text}");
+
+    // And off survives a save/load too: the toggle must stay off once turned
+    // off, not just default to off.
+    let off = Settings {
+        usb_power_fix: false,
+        ..settings
+    };
+    save_settings_to(&path, &off).unwrap();
+    assert_eq!(load_settings_from(&path), off);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("usb_power_fix=false"), "saved file: {text}");
 }
 
 #[test]
