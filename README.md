@@ -1,6 +1,6 @@
 # Importer
 
-A Linux desktop app (Rust + gpui) that copies photos and videos from a mounted Source into a dated Destination tree. The Source is never modified.
+A Linux desktop app that copies photos and videos from a mounted Source into a dated Destination tree. The Source is never modified.
 
 ## Run
 
@@ -38,10 +38,3 @@ The USB power fix is opt-in. Before an Import it disables kernel USB autosuspend
 cargo test   # core and integration tests, no GUI needed
 cargo run
 ```
-
-- `src/lib.rs` — core: scan, Taken Date, naming, copy, settings
-- `src/main.rs` — gpui shell: Import view and Settings form
-- `src/usb.rs` — USB power fix
-- `src/field.rs` — single-line text input
-- `tests/seams.rs` — integration tests through the core seams
-- `GLOSSARY.md` — domain terms; `AGENTS.md` — repo conventions
