@@ -13,8 +13,8 @@ use gpui::{
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
 use importer::{
-    MAX_CONCURRENCY, MIN_CONCURRENCY, Outcome, Settings, detect_roots, format_date, import_file,
-    load_settings, save_settings, scan, settings_from_form,
+    Outcome, Settings, clamp_concurrency, detect_roots, format_date, import_file, load_settings,
+    save_settings, scan, settings_from_form,
 };
 
 mod field;
@@ -183,35 +183,33 @@ impl Main {
                     if this.cancelled {
                         return None;
                     }
-                    // One existence check per window (see the ticket): files
-                    // already copying when the Source vanishes fail on their
-                    // own, and this check stops the run before the next
-                    // window, leaving its rows pending.
-                    if !this.rows.get(next).is_some_and(|row| row.src.exists()) {
+                    let end = (next + clamp_concurrency(this.settings.concurrency)).min(total);
+                    let window = (next..end)
+                        .filter_map(|i| {
+                            this.rows
+                                .get(i)
+                                .map(|row| (i, row.src.clone(), this.settings.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    // Every Source in the window is checked before launching it
+                    // (importer-tk5.3): files already copying when the Source
+                    // vanishes fail on their own, while a row whose Source is
+                    // already gone stops the run here with its rows still
+                    // pending and earlier results intact.
+                    if !window.iter().all(|(_, src, _)| src.exists()) {
                         this.source_lost = true;
                         return None;
                     }
-                    let size = this
-                        .settings
-                        .concurrency
-                        .clamp(MIN_CONCURRENCY, MAX_CONCURRENCY);
-                    let end = (next + size).min(total);
                     // The clock starts with the first launch, so any wait
                     // before the copy loop is excluded.
                     this.started_at.get_or_insert_with(Instant::now);
-                    Some(
-                        (next..end)
-                            .filter_map(|i| {
-                                this.rows
-                                    .get(i)
-                                    .map(|row| (i, row.src.clone(), this.settings.clone()))
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                    Some((end, window))
                 });
                 let Ok(window) = window else { return };
-                let Some(window) = window else { break };
-                next += window.len();
+                let Some((end, window)) = window else { break };
+                // The window's own end, not its length: the driver no longer
+                // depends on the window matching `end - next` row for row.
+                next = end;
                 let mut launches = Vec::with_capacity(window.len());
                 for (i, src, settings) in window {
                     // Separate task per row so a fast file paints its row
@@ -583,7 +581,7 @@ impl Main {
                 0x2a3242,
                 0x3a465e,
                 |this, cx| {
-                    this.concurrency = this.concurrency.saturating_sub(1).max(MIN_CONCURRENCY);
+                    this.concurrency = clamp_concurrency(this.concurrency.saturating_sub(1));
                     cx.notify();
                 },
             ))
@@ -600,7 +598,7 @@ impl Main {
                 0x2a3242,
                 0x3a465e,
                 |this, cx| {
-                    this.concurrency = (this.concurrency + 1).min(MAX_CONCURRENCY);
+                    this.concurrency = clamp_concurrency(this.concurrency.saturating_add(1));
                     cx.notify();
                 },
             ))
