@@ -5,3 +5,7 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Cargo build artifacts
+/target/
+/prototype/target/
