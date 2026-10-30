@@ -309,6 +309,7 @@ fn concurrency_1_and_3_produce_the_same_import() {
             dest_root: dir.path().join(root),
             date_format: "YYYYMMDD".into(),
             concurrency,
+            ..Settings::default()
         };
         let report = import_files(&files, &settings);
         (settings.dest_root, report)
@@ -483,15 +484,65 @@ fn settings_round_trip() {
         dest_root: dir.path().join("somewhere/photos"),
         date_format: "YYYY-MM-DD".into(),
         concurrency: 7,
+        usb_power_fix: true,
     };
 
     save_settings_to(&path, &settings).unwrap();
     let loaded = load_settings_from(&path);
 
     assert_eq!(loaded, settings);
-    // The number is a fourth flat key, not a format change.
+    // Each setting is its own flat key, not a format change.
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("concurrency=7"), "saved file: {text}");
+    assert!(text.contains("usb_power_fix=true"), "saved file: {text}");
+
+    // And off survives a save/load too: the toggle must stay off once turned
+    // off, not just default to off.
+    let off = Settings {
+        usb_power_fix: false,
+        ..settings
+    };
+    save_settings_to(&path, &off).unwrap();
+    assert_eq!(load_settings_from(&path), off);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("usb_power_fix=false"), "saved file: {text}");
+}
+
+#[test]
+fn fresh_settings_have_usb_power_fix_off() {
+    assert!(
+        !Settings::default().usb_power_fix,
+        "the fix must be opt-in: a fresh install never touches USB power"
+    );
+}
+
+#[test]
+fn file_without_usb_power_fix_loads_off_and_keeps_other_settings() {
+    // A settings file written before the toggle existed.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.conf");
+    std::fs::write(
+        &path,
+        "dest_root=/cards/imports\ndate_format=YYYY-MM-DD\nconcurrency=5\n",
+    )
+    .unwrap();
+
+    let loaded = load_settings_from(&path);
+
+    assert!(!loaded.usb_power_fix);
+    assert_eq!(loaded.dest_root, PathBuf::from("/cards/imports"));
+    assert_eq!(loaded.date_format, "YYYY-MM-DD");
+    assert_eq!(loaded.concurrency, 5);
+}
+
+#[test]
+fn unparseable_usb_power_fix_loads_off() {
+    // A hand-edited file must not turn the fix on by accident.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.conf");
+    std::fs::write(&path, "usb_power_fix=yes please\n").unwrap();
+
+    assert!(!load_settings_from(&path).usb_power_fix);
 }
 
 #[test]
@@ -602,15 +653,27 @@ fn form_text_builds_settings_with_empty_fallback() {
         dest_root: PathBuf::from("/photos/imports"),
         date_format: "YYYYMMDD".into(),
         concurrency: 3,
+        usb_power_fix: true,
     };
 
-    // Non-empty fields are trimmed and used; the stepper value rides along.
+    // Non-empty fields are trimmed and used; the stepper value and the USB
+    // toggle ride along, so the form keeps one path into Settings.
     assert_eq!(
-        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, &current),
+        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, true, &current),
         Settings {
             dest_root: PathBuf::from("/new/dest"),
             date_format: "YYYY-MM-DD".into(),
             concurrency: 7,
+            usb_power_fix: true,
+        }
+    );
+    assert_eq!(
+        importer::settings_from_form("/new/dest", "YYYY-MM-DD", 7, false, &current),
+        Settings {
+            dest_root: PathBuf::from("/new/dest"),
+            date_format: "YYYY-MM-DD".into(),
+            concurrency: 7,
+            usb_power_fix: false,
         }
     );
 
@@ -618,15 +681,16 @@ fn form_text_builds_settings_with_empty_fallback() {
     // empty value, and an empty Destination root would scatter the next
     // import into relative folders.
     assert_eq!(
-        importer::settings_from_form("", "", current.concurrency, &current),
+        importer::settings_from_form("", "", current.concurrency, true, &current),
         current
     );
     assert_eq!(
-        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, &current),
+        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, false, &current),
         Settings {
             dest_root: current.dest_root.clone(),
             date_format: "YYYYMMDD_HHMMSS".into(),
             concurrency: 1,
+            usb_power_fix: false,
         }
     );
 }

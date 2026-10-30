@@ -1,7 +1,8 @@
 //! The gpui shell — variant B layout as approved in the prototype
 //! (bd importer-cb5.1 verdict). All import behavior lives in the `importer`
-//! core; this file only wires it up — import view plus the settings form
-//! (the text-input widget lives in the `field` module).
+//! core; this file wires it up — import view plus the settings form
+//! (the text-input widget lives in the `field` module) — and decides whether
+//! and when the opt-in USB power fix runs before an Import.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,10 +15,15 @@ use gpui::{
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
 use importer::{
     Outcome, Settings, clamp_concurrency, detect_roots, format_date, import_file, load_settings,
-    save_settings, scan, settings_from_form,
+    save_settings, scan, settings_from_form, usb,
 };
 
 mod field;
+
+/// Accent pill colours (background, hover): Save, Import, USB fix On.
+const ACCENT: (u32, u32) = (0x2f6feb, 0x4f8cff);
+/// Neutral pill colours: Back, Cancel, Refresh, stepper, USB fix Off.
+const NEUTRAL: (u32, u32) = (0x2a3242, 0x3a465e);
 
 #[derive(Clone, Copy, PartialEq)]
 enum RowState {
@@ -32,6 +38,16 @@ enum RowState {
 enum Screen {
     Import,
     Settings,
+}
+
+/// This run's pre-Import USB phase: nothing happening, the privileged call
+/// waiting on sudo, or the fix not applied with the header's reason.
+#[derive(Default)]
+enum UsbPhase {
+    #[default]
+    Idle,
+    Applying,
+    NotApplied(String),
 }
 
 struct Row {
@@ -54,6 +70,9 @@ struct Main {
     started_at: Option<Instant>,
     /// This run's duration, frozen when it ends so the summary stops moving.
     elapsed: Option<Duration>,
+    /// This run's pre-Import USB phase; also feeds the status line and the
+    /// header note, so the two can never disagree.
+    usb_phase: UsbPhase,
     task: Option<Task<()>>,
     screen: Screen,
     dest_field: Entity<Field>,
@@ -61,6 +80,9 @@ struct Main {
     /// Stepper value while the settings form is open; only Save writes it
     /// into [`Settings`].
     concurrency: usize,
+    /// USB power fix toggle while the settings form is open; only Save writes
+    /// it into [`Settings`].
+    usb_power_fix: bool,
     save_error: Option<String>,
 }
 
@@ -70,6 +92,7 @@ impl Main {
         let rows = Self::scan_rows();
         Self {
             concurrency: settings.concurrency,
+            usb_power_fix: settings.usb_power_fix,
             settings,
             rows,
             imported: 0,
@@ -81,6 +104,7 @@ impl Main {
             source_lost: false,
             started_at: None,
             elapsed: None,
+            usb_phase: UsbPhase::Idle,
             task: None,
             screen: Screen::Import,
             dest_field: cx.new(|cx| Field::new("Destination root", cx)),
@@ -93,12 +117,13 @@ impl Main {
         if self.source_lost && !self.running {
             return "source lost — import stopped";
         }
-        match (self.running, self.cancelled, self.finished) {
-            (true, false, _) => "importing…",
-            (true, true, _) => "cancelling…",
-            (false, true, _) => "cancelled",
-            (false, false, true) => "done",
-            (false, false, false) => "ready",
+        match (&self.usb_phase, self.running, self.cancelled, self.finished) {
+            (UsbPhase::Applying, ..) => "applying USB power fix…",
+            (_, true, false, _) => "importing…",
+            (_, true, true, _) => "cancelling…",
+            (_, false, true, _) => "cancelled",
+            (_, false, false, true) => "done",
+            (_, false, false, false) => "ready",
         }
     }
 
@@ -156,6 +181,7 @@ impl Main {
         self.source_lost = false;
         self.started_at = None;
         self.elapsed = None;
+        self.usb_phase = UsbPhase::Idle;
     }
 
     /// Import starts only on click. Files launch in windows of
@@ -174,8 +200,35 @@ impl Main {
         }
         self.reset_run();
         self.running = true;
+        // A few unprivileged sysfs reads, cheap enough for the UI thread: a
+        // run that needs nothing must never show "applying…" or spawn sudo.
+        let apply_fix = self.settings.usb_power_fix && usb::is_fix_needed();
+        if apply_fix {
+            // Marked before the task spawns, so no repaint can pair
+            // "importing…" with a step that has not started yet.
+            self.usb_phase = UsbPhase::Applying;
+        }
         let total = self.rows.len();
         self.task = Some(cx.spawn(async move |this, cx| {
+            if apply_fix {
+                // Off the UI thread: sudo waits on the terminal while the
+                // window keeps painting.
+                let applied = cx
+                    .background_executor()
+                    .spawn(async move { usb::apply() })
+                    .await;
+                this.update(cx, |this, cx| {
+                    // Never abort: a cancelled prompt still imports.
+                    this.usb_phase = match applied {
+                        Ok(()) => UsbPhase::Idle,
+                        Err(reason) => {
+                            UsbPhase::NotApplied(format!("USB power fix not applied — {reason}"))
+                        }
+                    };
+                    cx.notify();
+                })
+                .ok();
+            }
             let mut next = 0;
             while next < total {
                 // Take the next window, or break: cancelled, or Source gone.
@@ -261,6 +314,7 @@ impl Main {
         self.dest_field.update(cx, |field, cx| field.set_text(&dest, cx));
         self.format_field.update(cx, |field, cx| field.set_text(&fmt, cx));
         self.concurrency = self.settings.concurrency;
+        self.usb_power_fix = self.settings.usb_power_fix;
         self.save_error = None;
         self.screen = Screen::Settings;
         cx.focus_view(&self.dest_field, window);
@@ -273,7 +327,13 @@ impl Main {
     fn save_settings_view(&mut self, cx: &mut Context<Self>) {
         let dest = self.dest_field.read(cx).text();
         let fmt = self.format_field.read(cx).text();
-        let new = settings_from_form(&dest, &fmt, self.concurrency, &self.settings);
+        let new = settings_from_form(
+            &dest,
+            &fmt,
+            self.concurrency,
+            self.usb_power_fix,
+            &self.settings,
+        );
         match save_settings(&new) {
             Ok(()) => {
                 self.settings = new;
@@ -318,8 +378,7 @@ impl Main {
         cx: &mut Context<Self>,
         id: &'static str,
         label: &'static str,
-        bg: u32,
-        hover_bg: u32,
+        colors: (u32, u32),
         f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div().id(id)
@@ -327,10 +386,10 @@ impl Main {
             .py_2()
             .rounded_full()
             .cursor_pointer()
-            .bg(rgb(bg))
+            .bg(rgb(colors.0))
             .text_color(rgb(0xffffff))
             .text_size(px(13.))
-            .hover(move |s| s.bg(rgb(hover_bg)))
+            .hover(move |s| s.bg(rgb(colors.1)))
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| f(this, cx)))
     }
@@ -383,6 +442,16 @@ impl Main {
                             }),
                     ),
             )
+            // Present only when this run could not apply the fix.
+            .children(match &self.usb_phase {
+                UsbPhase::NotApplied(note) => Some(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xff6b6b))
+                        .child(note.clone()),
+                ),
+                _ => None,
+            })
             .child(
                 div().w_full()
                     .h(px(8.))
@@ -391,7 +460,7 @@ impl Main {
                     .child(
                         div().h_full()
                             .rounded_full()
-                            .bg(rgb(0x4f8cff))
+                            .bg(rgb(ACCENT.1))
                             .w(relative(frac.max(0.004))),
                     ),
             )
@@ -517,6 +586,7 @@ impl Main {
                                     .child("How many files are copied at once — more in flight is not a speed guarantee"),
                             ),
                     ))
+                    .child(Self::form_row("USB power fix", self.usb_power_fix_row(cx)))
                     .child(
                         div().flex()
                             .items_start()
@@ -558,14 +628,43 @@ impl Main {
                     .items_center()
                     .px_6()
                     .py_4()
-                    .child(Self::button(cx, "save", "Save", 0x2f6feb, 0x4f8cff, |t, cx| {
+                    .child(Self::button(cx, "save", "Save", ACCENT, |t, cx| {
                         t.save_settings_view(cx)
                     }))
-                    .child(Self::button(cx, "back", "Back", 0x2a3242, 0x3a465e, |t, cx| {
+                    .child(Self::button(cx, "back", "Back", NEUTRAL, |t, cx| {
                         t.close_settings(cx)
                     })),
             )
             .into_any_element()
+    }
+
+    /// Off/On pill plus the known-issue warning. The toggle only rides into
+    /// the persisted Settings; `start` reads it and applies the fix.
+    fn usb_power_fix_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = if self.usb_power_fix { ACCENT } else { NEUTRAL };
+        div().flex()
+            .flex_col()
+            .gap_2()
+            .child(Self::button(
+                cx,
+                "usb-power-fix",
+                if self.usb_power_fix { "On" } else { "Off" },
+                colors,
+                |this, cx| {
+                    this.usb_power_fix = !this.usb_power_fix;
+                    cx.notify();
+                },
+            ))
+            .child(
+                div().text_sm()
+                    .text_color(rgb(0x9fb0c3))
+                    .child("Known issue: an idle USB card reader can be powered down by the kernel, which unmounts the Source mid-Import. Turning this on re-applies the temporary fix before each Import."),
+            )
+            .child(
+                div().text_xs()
+                    .text_color(rgb(0x556677))
+                    .child("Asks for your sudo password once per boot; the fix lasts until you reboot."),
+            )
     }
 
     /// `− N +` built from the footer pill buttons; stops at the bounds instead
@@ -578,8 +677,7 @@ impl Main {
                 cx,
                 "concurrency-down",
                 "−",
-                0x2a3242,
-                0x3a465e,
+                NEUTRAL,
                 |this, cx| {
                     this.concurrency = clamp_concurrency(this.concurrency.saturating_sub(1));
                     cx.notify();
@@ -595,8 +693,7 @@ impl Main {
                 cx,
                 "concurrency-up",
                 "+",
-                0x2a3242,
-                0x3a465e,
+                NEUTRAL,
                 |this, cx| {
                     this.concurrency = clamp_concurrency(this.concurrency.saturating_add(1));
                     cx.notify();
@@ -644,12 +741,12 @@ impl Render for Main {
                     // Running (including cancelling…): Cancel alone; hiding
                     // Import/Refresh matches what's actually actionable.
                     .child(if self.running {
-                        Self::button(cx, "cancel", "Cancel", 0x2a3242, 0x3a465e, |t, cx| {
+                        Self::button(cx, "cancel", "Cancel", NEUTRAL, |t, cx| {
                             t.cancel(cx)
                         })
                         .into_any_element()
                     } else {
-                        Self::button(cx, "import", "Import", 0x2f6feb, 0x4f8cff, |t, cx| {
+                        Self::button(cx, "import", "Import", ACCENT, |t, cx| {
                             t.start(cx)
                         })
                         .into_any_element()
@@ -657,7 +754,7 @@ impl Render for Main {
                     .child(if self.running {
                         div().into_any_element()
                     } else {
-                        Self::button(cx, "refresh", "Refresh", 0x2a3242, 0x3a465e, |t, cx| {
+                        Self::button(cx, "refresh", "Refresh", NEUTRAL, |t, cx| {
                             t.rescan(cx)
                         })
                         .into_any_element()
@@ -675,10 +772,10 @@ impl Render for Main {
                             .py_2()
                             .rounded_full()
                             .cursor_pointer()
-                            .bg(rgb(0x2a3242))
+                            .bg(rgb(NEUTRAL.0))
                             .text_color(rgb(0xffffff))
                             .text_size(px(13.))
-                            .hover(move |s| s.bg(rgb(0x3a465e)))
+                            .hover(move |s| s.bg(rgb(NEUTRAL.1)))
                             .child("⚙ Settings")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_settings(window, cx)
