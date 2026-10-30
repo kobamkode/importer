@@ -69,6 +69,7 @@ fn settings_in(dir: &TempDir, fmt: &str) -> Settings {
     Settings {
         dest_root: dir.path().join("dest"),
         date_format: fmt.to_string(),
+        ..Settings::default()
     }
 }
 
@@ -244,6 +245,7 @@ fn import_from_roots_produces_full_counts() {
     let settings = Settings {
         dest_root: dest.path().to_path_buf(),
         date_format: "YYYYMMDD".into(),
+        ..Settings::default()
     };
 
     let report = importer::import(&[root.path().to_path_buf()], &settings);
@@ -285,12 +287,45 @@ fn settings_round_trip() {
     let settings = Settings {
         dest_root: dir.path().join("somewhere/photos"),
         date_format: "YYYY-MM-DD".into(),
+        concurrency: 7,
     };
 
     save_settings_to(&path, &settings).unwrap();
     let loaded = load_settings_from(&path);
 
     assert_eq!(loaded, settings);
+    // The number is a fourth flat key, not a format change.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("concurrency=7"), "saved file: {text}");
+}
+
+#[test]
+fn file_without_concurrency_loads_3_and_keeps_other_settings() {
+    // A settings file written before the setting existed.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.conf");
+    std::fs::write(&path, "dest_root=/cards/imports\ndate_format=YYYY-MM-DD\n").unwrap();
+
+    let loaded = load_settings_from(&path);
+
+    assert_eq!(loaded.concurrency, 3);
+    assert_eq!(loaded.dest_root, PathBuf::from("/cards/imports"));
+    assert_eq!(loaded.date_format, "YYYY-MM-DD");
+}
+
+#[test]
+fn out_of_range_or_non_numeric_concurrency_is_clamped_on_load() {
+    let dir = TempDir::new().unwrap();
+
+    for (written, expected) in [("0", 1), ("11", 10), ("500", 10), ("many", 3), ("-2", 3)] {
+        let path = dir.path().join(format!("{written}.conf"));
+        std::fs::write(&path, format!("concurrency={written}\n")).unwrap();
+        assert_eq!(
+            load_settings_from(&path).concurrency,
+            expected,
+            "concurrency={written} must land inside 1–10"
+        );
+    }
 }
 
 #[test]
@@ -299,6 +334,7 @@ fn missing_settings_file_yields_defaults_through_entry_point() {
     let mut settings = load_settings_from(&dir.path().join("nope.conf"));
     assert_eq!(settings, Settings::default());
     assert_eq!(settings.date_format, "YYYYMMDD");
+    assert_eq!(settings.concurrency, 3, "fresh install copies files in parallel");
     assert!(
         settings.dest_root.ends_with("Pictures/Imports"),
         "default dest is under HOME: {}",
@@ -320,6 +356,7 @@ fn changing_date_format_changes_next_import() {
     let mut settings = Settings {
         dest_root: dir.path().join("dest"),
         date_format: "YYYY-MM-DD".into(),
+        ..Settings::default()
     };
     save_settings_to(&path, &settings).unwrap();
 
@@ -353,6 +390,7 @@ fn settings_file_is_the_single_mechanism() {
     // Empty value rejected at the boundary → default kept.
     assert_eq!(loaded.date_format, "YYYYMMDD");
     assert_eq!(loaded.dest_root, Settings::default().dest_root);
+    assert_eq!(loaded.concurrency, 3);
 }
 
 // ---------- settings form input (importer-cb5.6) ----------
@@ -362,14 +400,16 @@ fn form_text_builds_settings_with_empty_fallback() {
     let current = Settings {
         dest_root: PathBuf::from("/photos/imports"),
         date_format: "YYYYMMDD".into(),
+        concurrency: 3,
     };
 
-    // Non-empty fields are trimmed and used.
+    // Non-empty fields are trimmed and used; the stepper value rides along.
     assert_eq!(
-        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", &current),
+        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, &current),
         Settings {
             dest_root: PathBuf::from("/new/dest"),
             date_format: "YYYY-MM-DD".into(),
+            concurrency: 7,
         }
     );
 
@@ -377,14 +417,15 @@ fn form_text_builds_settings_with_empty_fallback() {
     // empty value, and an empty Destination root would scatter the next
     // import into relative folders.
     assert_eq!(
-        importer::settings_from_form("", "", &current),
+        importer::settings_from_form("", "", current.concurrency, &current),
         current
     );
     assert_eq!(
-        importer::settings_from_form("", "YYYYMMDD_HHMMSS", &current),
+        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, &current),
         Settings {
             dest_root: current.dest_root.clone(),
             date_format: "YYYYMMDD_HHMMSS".into(),
+            concurrency: 1,
         }
     );
 }
