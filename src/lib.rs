@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use chrono::{Datelike, Local, NaiveDateTime, Timelike};
 use nom_exif::{ExifTag, Metadata, TrackInfoTag, read_metadata};
 
+pub mod usb;
+
 /// Bounds of the parallel-imports stepper, and its fresh-install value.
 pub const MIN_CONCURRENCY: usize = 1;
 pub const MAX_CONCURRENCY: usize = 10;
@@ -36,7 +38,6 @@ pub struct Settings {
     /// [`MIN_CONCURRENCY`]..=[`MAX_CONCURRENCY`].
     pub concurrency: usize,
     /// Opt-in: keep USB devices powered during an Import (off by default).
-    /// Nothing reads it yet; a later slice applies the fix.
     pub usb_power_fix: bool,
 }
 
