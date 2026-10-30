@@ -35,6 +35,9 @@ pub struct Settings {
     /// How many files one Import may copy at once, always within
     /// [`MIN_CONCURRENCY`]..=[`MAX_CONCURRENCY`].
     pub concurrency: usize,
+    /// Opt-in: keep USB devices powered during an Import (off by default).
+    /// Nothing reads it yet; a later slice applies the fix.
+    pub usb_power_fix: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +50,7 @@ impl Default for Settings {
             dest_root,
             date_format: "YYYYMMDD".to_string(),
             concurrency: DEFAULT_CONCURRENCY,
+            usb_power_fix: false,
         }
     }
 }
@@ -104,6 +108,9 @@ pub fn load_settings_from(path: &Path) -> Settings {
                     settings.concurrency = clamp_concurrency(n);
                 }
             }
+            // Only an explicit `true` opts in; anything else (including a
+            // typo) stays off, so the fix is never enabled by accident.
+            "usb_power_fix" => settings.usb_power_fix = value.eq_ignore_ascii_case("true"),
             _ => {} // unknown keys: forward-compatible, ignored
         }
     }
@@ -122,23 +129,25 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> std::io::Result<()>
     std::fs::write(
         path,
         format!(
-            "dest_root={}\ndate_format={}\nconcurrency={}\n",
+            "dest_root={}\ndate_format={}\nconcurrency={}\nusb_power_fix={}\n",
             settings.dest_root.display(),
             settings.date_format,
-            settings.concurrency
+            settings.concurrency,
+            settings.usb_power_fix
         ),
     )
 }
 
 /// Build the [`Settings`] to persist from raw settings-form text plus the
-/// stepper's value. Values are trimmed; a field the user emptied keeps its
-/// current value — the flat file format can't represent an empty value (see
-/// [`load_settings_from`]), and an empty Destination root would scatter the
-/// next import into relative folders.
+/// stepper's value and the USB power fix toggle. Values are trimmed; a field
+/// the user emptied keeps its current value — the flat file format can't
+/// represent an empty value (see [`load_settings_from`]), and an empty
+/// Destination root would scatter the next import into relative folders.
 pub fn settings_from_form(
     dest_root: &str,
     date_format: &str,
     concurrency: usize,
+    usb_power_fix: bool,
     current: &Settings,
 ) -> Settings {
     let dest_root = dest_root.trim();
@@ -155,6 +164,7 @@ pub fn settings_from_form(
             date_format.to_string()
         },
         concurrency: clamp_concurrency(concurrency),
+        usb_power_fix,
     }
 }
 

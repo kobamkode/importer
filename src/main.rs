@@ -61,6 +61,9 @@ struct Main {
     /// Stepper value while the settings form is open; only Save writes it
     /// into [`Settings`].
     concurrency: usize,
+    /// USB power fix toggle while the settings form is open; only Save writes
+    /// it into [`Settings`].
+    usb_power_fix: bool,
     save_error: Option<String>,
 }
 
@@ -70,6 +73,7 @@ impl Main {
         let rows = Self::scan_rows();
         Self {
             concurrency: settings.concurrency,
+            usb_power_fix: settings.usb_power_fix,
             settings,
             rows,
             imported: 0,
@@ -261,6 +265,7 @@ impl Main {
         self.dest_field.update(cx, |field, cx| field.set_text(&dest, cx));
         self.format_field.update(cx, |field, cx| field.set_text(&fmt, cx));
         self.concurrency = self.settings.concurrency;
+        self.usb_power_fix = self.settings.usb_power_fix;
         self.save_error = None;
         self.screen = Screen::Settings;
         cx.focus_view(&self.dest_field, window);
@@ -273,7 +278,13 @@ impl Main {
     fn save_settings_view(&mut self, cx: &mut Context<Self>) {
         let dest = self.dest_field.read(cx).text();
         let fmt = self.format_field.read(cx).text();
-        let new = settings_from_form(&dest, &fmt, self.concurrency, &self.settings);
+        let new = settings_from_form(
+            &dest,
+            &fmt,
+            self.concurrency,
+            self.usb_power_fix,
+            &self.settings,
+        );
         match save_settings(&new) {
             Ok(()) => {
                 self.settings = new;
@@ -517,6 +528,7 @@ impl Main {
                                     .child("How many files are copied at once — more in flight is not a speed guarantee"),
                             ),
                     ))
+                    .child(Self::form_row("USB power fix", self.usb_power_fix_row(cx)))
                     .child(
                         div().flex()
                             .items_start()
@@ -566,6 +578,40 @@ impl Main {
                     })),
             )
             .into_any_element()
+    }
+
+    /// Off/On pill plus the known-issue warning. Nothing reads the toggle yet:
+    /// it only rides into the persisted Settings.
+    fn usb_power_fix_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (bg, hover_bg) = if self.usb_power_fix {
+            (0x2f6feb, 0x4f8cff)
+        } else {
+            (0x2a3242, 0x3a465e)
+        };
+        div().flex()
+            .flex_col()
+            .gap_2()
+            .child(Self::button(
+                cx,
+                "usb-power-fix",
+                if self.usb_power_fix { "On" } else { "Off" },
+                bg,
+                hover_bg,
+                |this, cx| {
+                    this.usb_power_fix = !this.usb_power_fix;
+                    cx.notify();
+                },
+            ))
+            .child(
+                div().text_sm()
+                    .text_color(rgb(0x9fb0c3))
+                    .child("Known issue: an idle USB card reader can be powered down by the kernel, which unmounts the Source mid-Import. Turning this on re-applies the temporary fix before each Import."),
+            )
+            .child(
+                div().text_xs()
+                    .text_color(rgb(0x556677))
+                    .child("Asks for your sudo password once per boot; the fix lasts until you reboot."),
+            )
     }
 
     /// `− N +` built from the footer pill buttons; stops at the bounds instead
