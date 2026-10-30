@@ -60,14 +60,7 @@ struct Main {
 impl Main {
     fn new(cx: &mut Context<Self>) -> Self {
         let settings = load_settings();
-        let rows = scan(&detect_roots())
-            .into_iter()
-            .map(|src| Row {
-                src,
-                dest: None,
-                state: RowState::Pending,
-            })
-            .collect();
+        let rows = Self::scan_rows();
         Self {
             settings,
             rows,
@@ -115,6 +108,18 @@ impl Main {
         self.imported + self.failed + self.skipped
     }
 
+    /// A fresh scan as pending rows — Launch and Refresh share this.
+    fn scan_rows() -> Vec<Row> {
+        scan(&detect_roots())
+            .into_iter()
+            .map(|src| Row {
+                src,
+                dest: None,
+                state: RowState::Pending,
+            })
+            .collect()
+    }
+
     /// Launch/Refresh: re-detect mounts, re-scan, reset the run. Sync on
     /// purpose — shortcut: a mount with a huge tree will jank the UI thread;
     /// move the scan to the background executor if that ever bites.
@@ -122,14 +127,7 @@ impl Main {
         if self.running {
             return;
         }
-        self.rows = scan(&detect_roots())
-            .into_iter()
-            .map(|src| Row {
-                src,
-                dest: None,
-                state: RowState::Pending,
-            })
-            .collect();
+        self.rows = Self::scan_rows();
         self.reset_run();
         cx.notify();
     }
