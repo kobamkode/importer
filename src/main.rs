@@ -14,7 +14,7 @@ use gpui::{
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
 use importer::{
     Outcome, Settings, clamp_concurrency, detect_roots, format_date, import_file, load_settings,
-    save_settings, scan, settings_from_form,
+    save_settings, scan, settings_from_form, usb,
 };
 
 mod field;
@@ -54,6 +54,11 @@ struct Main {
     started_at: Option<Instant>,
     /// This run's duration, frozen when it ends so the summary stops moving.
     elapsed: Option<Duration>,
+    /// True while the USB power fix is being checked/applied, before the first
+    /// file. Keeps the status line honest during the password wait.
+    usb_fixing: bool,
+    /// Header note when this run could not apply the USB power fix.
+    usb_fix_note: Option<String>,
     task: Option<Task<()>>,
     screen: Screen,
     dest_field: Entity<Field>,
@@ -85,6 +90,8 @@ impl Main {
             source_lost: false,
             started_at: None,
             elapsed: None,
+            usb_fixing: false,
+            usb_fix_note: None,
             task: None,
             screen: Screen::Import,
             dest_field: cx.new(|cx| Field::new("Destination root", cx)),
@@ -96,6 +103,9 @@ impl Main {
     fn status(&self) -> &'static str {
         if self.source_lost && !self.running {
             return "source lost — import stopped";
+        }
+        if self.usb_fixing {
+            return "applying USB power fix…";
         }
         match (self.running, self.cancelled, self.finished) {
             (true, false, _) => "importing…",
@@ -160,6 +170,8 @@ impl Main {
         self.source_lost = false;
         self.started_at = None;
         self.elapsed = None;
+        self.usb_fixing = false;
+        self.usb_fix_note = None;
     }
 
     /// Import starts only on click. Files launch in windows of
@@ -178,8 +190,31 @@ impl Main {
         }
         self.reset_run();
         self.running = true;
+        let apply_fix = self.settings.usb_power_fix;
         let total = self.rows.len();
         self.task = Some(cx.spawn(async move |this, cx| {
+            if apply_fix {
+                // Before the first file, off the UI thread: sudo waits on the
+                // terminal while the window keeps painting.
+                this.update(cx, |this, cx| {
+                    this.usb_fixing = true;
+                    cx.notify();
+                })
+                .ok();
+                let applied = cx
+                    .background_executor()
+                    .spawn(async move { usb::apply() })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.usb_fixing = false;
+                    // Never abort: a cancelled prompt still imports.
+                    this.usb_fix_note = applied
+                        .err()
+                        .map(|reason| format!("USB power fix not applied — {reason}"));
+                    cx.notify();
+                })
+                .ok();
+            }
             let mut next = 0;
             while next < total {
                 // Take the next window, or break: cancelled, or Source gone.
@@ -394,6 +429,14 @@ impl Main {
                             }),
                     ),
             )
+            // Present only when this run could not apply the fix; an empty
+            // Option adds no element (and no gap).
+            .children(self.usb_fix_note.as_ref().map(|note| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xff6b6b))
+                    .child(note.clone())
+            }))
             .child(
                 div().w_full()
                     .h(px(8.))
@@ -580,8 +623,8 @@ impl Main {
             .into_any_element()
     }
 
-    /// Off/On pill plus the known-issue warning. Nothing reads the toggle yet:
-    /// it only rides into the persisted Settings.
+    /// Off/On pill plus the known-issue warning. The toggle only rides into
+    /// the persisted Settings; `start` reads it and applies the fix.
     fn usb_power_fix_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (bg, hover_bg) = if self.usb_power_fix {
             (0x2f6feb, 0x4f8cff)
