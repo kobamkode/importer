@@ -151,6 +151,24 @@ fn existing_destination_file_is_not_overwritten() {
 }
 
 #[test]
+fn skipped_file_reports_existing_destination() {
+    let dir = TempDir::new().unwrap();
+    let src = jpeg_with_exif(dir.path(), "IMG_9.jpg", "2026:10:10 14:32:55");
+    let settings = settings_in(&dir, "YYYYMMDD");
+    import_files(&[src.clone()], &settings);
+
+    // US13: the user must be able to verify where every file went — skipped
+    // files report the Destination path that already holds identical content.
+    match importer::import_file(&src, &settings) {
+        importer::Outcome::Skipped(dest) => assert_eq!(
+            dest,
+            settings.dest_root.join("20261010/20261010_IMG_9.jpg")
+        ),
+        other => panic!("expected Skipped(existing destination), got {other:?}"),
+    }
+}
+
+#[test]
 fn identical_content_is_skipped_on_rerun() {
     let dir = TempDir::new().unwrap();
     let src = jpeg_with_exif(dir.path(), "IMG_9.jpg", "2026:10:10 14:32:55");

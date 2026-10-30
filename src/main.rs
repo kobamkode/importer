@@ -13,8 +13,8 @@ use gpui::{
     WindowOptions, div, fill, hsla, prelude::*, px, point, relative, rgb, rgba, size,
 };
 use importer::{
-    Report, Settings, detect_roots, format_date, import_files, load_settings, save_settings, scan,
-    settings_from_form,
+    Outcome, Settings, detect_roots, format_date, import_file, load_settings, save_settings,
+    scan, settings_from_form,
 };
 
 actions!(settings_field, [Backspace, Delete, SelectAll, Paste, Commit]);
@@ -181,12 +181,12 @@ impl Main {
                     .ok();
                     return;
                 }
-                let report = cx
+                let outcome = cx
                     .background_executor()
-                    .spawn(async move { import_files(&[src], &settings) })
+                    .spawn(async move { import_file(&src, &settings) })
                     .await;
                 let applied = this.update(cx, |this, cx| {
-                    this.apply(i, report);
+                    this.apply(i, outcome);
                     cx.notify();
                 });
                 if applied.is_err() {
@@ -250,18 +250,26 @@ impl Main {
         cx.notify();
     }
 
-    fn apply(&mut self, i: usize, report: Report) {
+    /// One file's outcome drives its row directly — no re-derivation from
+    /// Report counts. Skipped rows carry the Destination that already holds
+    /// the content (US13: verify where every file went).
+    fn apply(&mut self, i: usize, outcome: Outcome) {
         let Some(row) = self.rows.get_mut(i) else { return };
-        if report.imported == 1 {
-            row.state = RowState::Imported;
-            row.dest = report.mappings.first().map(|(_, dest)| dest.clone());
-            self.imported += 1;
-        } else if report.failed == 1 {
-            row.state = RowState::Failed;
-            self.failed += 1;
-        } else if report.skipped == 1 {
-            row.state = RowState::Skipped;
-            self.skipped += 1;
+        match outcome {
+            Outcome::Imported(dest) => {
+                row.state = RowState::Imported;
+                row.dest = Some(dest);
+                self.imported += 1;
+            }
+            Outcome::Skipped(dest) => {
+                row.state = RowState::Skipped;
+                row.dest = Some(dest);
+                self.skipped += 1;
+            }
+            Outcome::Failed => {
+                row.state = RowState::Failed;
+                self.failed += 1;
+            }
         }
     }
 
@@ -392,7 +400,11 @@ impl Main {
                     RowState::Skipped => (
                         "=",
                         0x7d8aa0,
-                        format!("{}  (already in Destination)", row.src.display()),
+                        format!(
+                            "{}  →  {} (already in Destination)",
+                            row.src.display(),
+                            row.dest.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
+                        ),
                         0x9fb0c3,
                     ),
                 };

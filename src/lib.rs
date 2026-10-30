@@ -1,8 +1,9 @@
 //! Import core: copies media files from a Source into a date-organized Destination.
 //!
 //! No UI, no gpui — the shell wraps this. Domain terms: see `GLOSSARY.md`.
-//! Two test seams live here: [`import_files`] (the core entry point) and
-//! [`taken_date`] (the Taken Date parser).
+//! Test seams live here: [`import_files`] and its per-file form
+//! [`import_file`] (the entry points), and [`taken_date`] (the Taken Date
+//! parser).
 
 use std::path::{Path, PathBuf};
 
@@ -272,25 +273,31 @@ pub fn import(roots: &[PathBuf], settings: &Settings) -> Report {
 pub fn import_files(files: &[PathBuf], settings: &Settings) -> Report {
     let mut report = Report::default();
     for src in files {
-        match import_one(src, settings) {
+        match import_file(src, settings) {
             Outcome::Imported(dest) => {
                 report.mappings.push((src.clone(), dest));
                 report.imported += 1;
             }
-            Outcome::Skipped => report.skipped += 1,
+            Outcome::Skipped(_) => report.skipped += 1,
             Outcome::Failed => report.failed += 1,
         }
     }
     report
 }
 
-enum Outcome {
+/// What one file did during an import.
+#[derive(Debug)]
+pub enum Outcome {
     Imported(PathBuf),
-    Skipped,
+    /// Identical content already lives at this Destination path.
+    Skipped(PathBuf),
     Failed,
 }
 
-fn import_one(src: &Path, settings: &Settings) -> Outcome {
+/// Import a single file; what happened to it. [`import_files`] is this per
+/// file, tallied into a [`Report`]. The shell calls this directly so each
+/// row can show its own result as it lands.
+pub fn import_file(src: &Path, settings: &Settings) -> Outcome {
     let Some(date) = taken_date(src) else { return Outcome::Failed };
     let stamped = format_date(date, &settings.date_format);
     let Some(name) = src.file_name() else { return Outcome::Failed };
@@ -317,7 +324,7 @@ fn import_one(src: &Path, settings: &Settings) -> Outcome {
             };
         }
         if same_content(src, &dest) {
-            return Outcome::Skipped;
+            return Outcome::Skipped(dest);
         }
     }
     Outcome::Failed
