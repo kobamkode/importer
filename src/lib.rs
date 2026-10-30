@@ -139,14 +139,15 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> std::io::Result<()>
 }
 
 /// Build the [`Settings`] to persist from raw settings-form text plus the
-/// stepper's value. Values are trimmed; a field the user emptied keeps its
-/// current value — the flat file format can't represent an empty value (see
-/// [`load_settings_from`]), and an empty Destination root would scatter the
-/// next import into relative folders.
+/// stepper's value and the USB power fix toggle. Values are trimmed; a field
+/// the user emptied keeps its current value — the flat file format can't
+/// represent an empty value (see [`load_settings_from`]), and an empty
+/// Destination root would scatter the next import into relative folders.
 pub fn settings_from_form(
     dest_root: &str,
     date_format: &str,
     concurrency: usize,
+    usb_power_fix: bool,
     current: &Settings,
 ) -> Settings {
     let dest_root = dest_root.trim();
@@ -163,7 +164,7 @@ pub fn settings_from_form(
             date_format.to_string()
         },
         concurrency: clamp_concurrency(concurrency),
-        usb_power_fix: current.usb_power_fix,
+        usb_power_fix,
     }
 }
 

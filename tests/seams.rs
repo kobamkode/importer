@@ -642,12 +642,22 @@ fn form_text_builds_settings_with_empty_fallback() {
         dest_root: PathBuf::from("/photos/imports"),
         date_format: "YYYYMMDD".into(),
         concurrency: 3,
-        usb_power_fix: false,
+        usb_power_fix: true,
     };
 
-    // Non-empty fields are trimmed and used; the stepper value rides along.
+    // Non-empty fields are trimmed and used; the stepper value and the USB
+    // toggle ride along, so the form keeps one path into Settings.
     assert_eq!(
-        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, &current),
+        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, true, &current),
+        Settings {
+            dest_root: PathBuf::from("/new/dest"),
+            date_format: "YYYY-MM-DD".into(),
+            concurrency: 7,
+            usb_power_fix: true,
+        }
+    );
+    assert_eq!(
+        importer::settings_from_form("/new/dest", "YYYY-MM-DD", 7, false, &current),
         Settings {
             dest_root: PathBuf::from("/new/dest"),
             date_format: "YYYY-MM-DD".into(),
@@ -660,11 +670,11 @@ fn form_text_builds_settings_with_empty_fallback() {
     // empty value, and an empty Destination root would scatter the next
     // import into relative folders.
     assert_eq!(
-        importer::settings_from_form("", "", current.concurrency, &current),
+        importer::settings_from_form("", "", current.concurrency, true, &current),
         current
     );
     assert_eq!(
-        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, &current),
+        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, false, &current),
         Settings {
             dest_root: current.dest_root.clone(),
             date_format: "YYYYMMDD_HHMMSS".into(),
