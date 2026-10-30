@@ -197,6 +197,23 @@ fn scan_finds_media_recursively_across_roots_and_skips_junk() {
 }
 
 #[test]
+fn misc_directory_is_invisible() {
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("DCIM")).unwrap();
+    std::fs::create_dir_all(root.path().join("MISC")).unwrap();
+    std::fs::copy(fixture("base.jpg"), root.path().join("MISC/whatever.jpg")).unwrap();
+    std::fs::copy(fixture("base.jpg"), root.path().join("DCIM/keep.jpg")).unwrap();
+
+    let found = importer::scan(&[root.path().to_path_buf()]);
+
+    assert_eq!(
+        found,
+        vec![root.path().join("DCIM/keep.jpg")],
+        "MISC/ holds non-media per camera convention (US12); DCIM/ is scanned"
+    );
+}
+
+#[test]
 fn import_from_roots_produces_full_counts() {
     let root = TempDir::new().unwrap();
     let dest = TempDir::new().unwrap();

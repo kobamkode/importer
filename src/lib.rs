@@ -210,6 +210,7 @@ pub fn detect_roots() -> Vec<PathBuf> {
 }
 
 /// Recursively find importable files under `roots`, sorted for a stable run.
+/// Directories named `MISC` are not descended into (camera convention).
 /// Symlinked directories are not followed (no cycles off a mount).
 pub fn scan(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -234,6 +235,11 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(file_type) = entry.file_type() else { continue };
         let path = entry.path();
         if file_type.is_dir() {
+            // MISC/ is a camera convention for thumbnails and miscellany, not
+            // media — invisible at any depth (spec US12).
+            if entry.file_name() == "MISC" {
+                continue;
+            }
             walk(&path, out);
         } else if file_type.is_file() && is_media(&path) && !is_junk(&path) {
             out.push(path);
