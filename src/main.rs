@@ -537,8 +537,13 @@ impl Render for Main {
                         .into_any_element()
                     })
                     // Gear, pushed to the right; opens the settings form.
+                    // Hidden while an import runs: settings take effect on
+                    // the next import (cb5.6), so a mid-run save would split
+                    // one run across two destinations.
                     .child(div().flex_1())
-                    .child(
+                    .child(if self.running {
+                        div().into_any_element()
+                    } else {
                         div().id("settings")
                             .px_5()
                             .py_2()
@@ -551,8 +556,9 @@ impl Render for Main {
                             .child("⚙ Settings")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_settings(window, cx)
-                            })),
-                    ),
+                            }))
+                            .into_any_element()
+                    }),
             )
             .into_any_element()
     }
