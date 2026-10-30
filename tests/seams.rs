@@ -14,6 +14,8 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+// HEIC/RAW fixtures untested: no encoder/sample on this machine — known gap, see importer-cb5 notes
+
 /// Copy a fixture into `dir` and stamp it with a known DateTimeOriginal.
 fn jpeg_with_exif(dir: &Path, file_name: &str, exif_date: &str) -> PathBuf {
     let path = dir.join(file_name);
