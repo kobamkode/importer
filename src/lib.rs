@@ -17,6 +17,13 @@ pub const MIN_CONCURRENCY: usize = 1;
 pub const MAX_CONCURRENCY: usize = 10;
 pub const DEFAULT_CONCURRENCY: usize = 3;
 
+/// Bring any concurrency value inside [`MIN_CONCURRENCY`]..=[`MAX_CONCURRENCY`].
+/// Settings can arrive from a hand-edited file, the form or the stepper, so
+/// every one of those paths clamps here rather than at the use site.
+pub fn clamp_concurrency(n: usize) -> usize {
+    n.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY)
+}
+
 /// User-configured preferences that drive where and how files are written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -94,7 +101,7 @@ pub fn load_settings_from(path: &Path) -> Settings {
             // a number keeps the default.
             "concurrency" => {
                 if let Ok(n) = value.parse::<usize>() {
-                    settings.concurrency = n.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY);
+                    settings.concurrency = clamp_concurrency(n);
                 }
             }
             _ => {} // unknown keys: forward-compatible, ignored
@@ -147,7 +154,7 @@ pub fn settings_from_form(
         } else {
             date_format.to_string()
         },
-        concurrency: concurrency.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY),
+        concurrency: clamp_concurrency(concurrency),
     }
 }
 
@@ -299,19 +306,18 @@ pub fn import(roots: &[PathBuf], settings: &Settings) -> Report {
 ///
 /// Copies up to `settings.concurrency` files at once, with that many stdlib
 /// scoped workers sharing a cursor over `files`. The outcomes (and therefore
-/// [`Report::mappings`]) are always reported in `files` order, so a run at 2+
-/// produces the same report as a sequential one. At 1 this is today's loop.
+/// [`Report::mappings`]) are always reported in `files` order, so for inputs
+/// with distinct content a run at 2+ has the same order and counts as a
+/// sequential one. At 1 this is today's loop.
 ///
-/// Two *identical-content* files in flight together are not the same as two
-/// sequential ones: the first reserves a name (empty) before its bytes land,
-/// so the second cannot see identical content yet and claims a suffix instead
-/// of being skipped. Accepted — the alternative is holding the name lock
-/// across the copy, which serializes exactly what this parallelizes.
+/// Two *byte-identical* files landing in the same window are the exception to
+/// the counts: the first reserves a name (empty) before its bytes land, so the
+/// second cannot see identical content yet and claims a `-N` suffix instead of
+/// reporting a skip. Accepted, and nothing is lost — both files are on disk at
+/// distinct names. The alternative is holding the name lock across the copy,
+/// which serializes exactly what this parallelizes.
 pub fn import_files(files: &[PathBuf], settings: &Settings) -> Report {
-    let workers = settings
-        .concurrency
-        .clamp(MIN_CONCURRENCY, MAX_CONCURRENCY)
-        .min(files.len());
+    let workers = clamp_concurrency(settings.concurrency).min(files.len());
     let outcomes: Vec<Option<Outcome>> = if workers > 1 {
         let outcomes = Mutex::new(files.iter().map(|_| None).collect::<Vec<_>>());
         let cursor = AtomicUsize::new(0);
