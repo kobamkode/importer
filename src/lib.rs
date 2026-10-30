@@ -6,6 +6,7 @@
 //! parser).
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use chrono::{Datelike, Local, NaiveDateTime, Timelike};
 use nom_exif::{ExifTag, Metadata, TrackInfoTag, read_metadata};
@@ -304,30 +305,66 @@ pub fn import_file(src: &Path, settings: &Settings) -> Outcome {
     let dir = settings.dest_root.join(&stamped);
     let primary = dir.join(format!("{stamped}_{}", name.to_string_lossy()));
 
-    // 0 tries the plain name, then -1, -2, … A free slot means this content
-    // isn't here yet; an occupied slot with our exact bytes means it already
-    // is (idempotent re-run). Bound the hunt so a pathological Source can't
-    // spin forever.
+    let claim = {
+        let _guard = NAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        claim_name(&primary, src, &dir)
+    };
+    match claim {
+        Claim::Reserved(dest) => match std::fs::copy(src, &dest) {
+            Ok(_) => Outcome::Imported(dest),
+            Err(_) => {
+                // A failed copy must not leave its claim behind, or the next
+                // file wanting this name would be pushed onto a suffix.
+                let _ = std::fs::remove_file(&dest);
+                Outcome::Failed
+            }
+        },
+        Claim::Skipped(dest) => Outcome::Skipped(dest),
+        Claim::Failed => Outcome::Failed,
+    }
+}
+
+/// Serializes the Destination name hunt across every Import in this process.
+/// Held only while probing a name (and comparing existing content), never
+/// across a copy.
+static NAME_LOCK: Mutex<()> = Mutex::new(());
+
+enum Claim {
+    /// The name is ours: the file was created exclusively (and is empty).
+    Reserved(PathBuf),
+    Skipped(PathBuf),
+    Failed,
+}
+
+/// Find a free Destination name and create it exclusively so another file
+/// cannot claim it too. 0 tries the plain name, then -1, -2, … An occupied
+/// slot with our exact bytes means the content is already here (idempotent
+/// re-run). Bound the hunt so a pathological Source can't spin forever.
+fn claim_name(primary: &Path, src: &Path, dir: &Path) -> Claim {
+    if std::fs::create_dir_all(dir).is_err() {
+        return Claim::Failed;
+    }
     for n in 0..10_000u32 {
         let dest = if n == 0 {
-            primary.clone()
+            primary.to_path_buf()
         } else {
-            suffixed(&primary, n)
+            suffixed(primary, n)
         };
-        if !dest.exists() {
-            if std::fs::create_dir_all(&dir).is_err() {
-                return Outcome::Failed;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(_) => return Claim::Reserved(dest),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if same_content(src, &dest) {
+                    return Claim::Skipped(dest);
+                }
             }
-            return match std::fs::copy(src, &dest) {
-                Ok(_) => Outcome::Imported(dest),
-                Err(_) => Outcome::Failed,
-            };
-        }
-        if same_content(src, &dest) {
-            return Outcome::Skipped(dest);
+            Err(_) => return Claim::Failed,
         }
     }
-    Outcome::Failed
+    Claim::Failed
 }
 
 /// `name.jpg` → `name-1.jpg` (suffix before the extension, on the already
