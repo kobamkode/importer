@@ -276,6 +276,81 @@ fn same_name_different_content_gets_suffix() {
     assert!(d.join("20261010_IMG_1-1.jpg").exists());
 }
 
+// ---------- failed copy cleanup (importer-tk5.2) ----------
+
+/// A Source that yields a Taken Date (its mtime) but that `std::fs::copy`
+/// cannot read: a directory wearing a media name. It fails *after* the
+/// Destination name is claimed, which is the path the cleanup must survive.
+fn uncopyable_source(dir: &Path, file_name: &str, mtime: SystemTime) -> PathBuf {
+    let path = dir.join(file_name);
+    std::fs::create_dir(&path).unwrap();
+    std::fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
+    path
+}
+
+#[test]
+fn failed_copy_leaves_no_file_at_claimed_destination() {
+    let dir = TempDir::new().unwrap();
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1767323045);
+    let broken = uncopyable_source(dir.path(), "IMG_1.jpg", mtime);
+    let settings = settings_in(&dir, "YYYYMMDD");
+    let stamped = format_date(taken_date(&broken).unwrap(), &settings.date_format);
+
+    let report = import_files(&[broken], &settings);
+
+    assert_eq!(report.failed, 1);
+    let claimed = settings
+        .dest_root
+        .join(&stamped)
+        .join(format!("{stamped}_IMG_1.jpg"));
+    assert!(
+        !claimed.exists(),
+        "failed copy must remove its claimed name: {}",
+        claimed.display()
+    );
+}
+
+#[test]
+fn file_after_failed_copy_gets_plain_name() {
+    let dir = TempDir::new().unwrap();
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1767323045);
+    let broken = uncopyable_source(dir.path(), "IMG_1.jpg", mtime);
+    // Same file name and Taken Date as `broken`, but this one can be copied.
+    let good = dir.path().join("other").join("IMG_1.jpg");
+    std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+    std::fs::copy(fixture("base.jpg"), &good).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&good)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let settings = settings_in(&dir, "YYYYMMDD");
+    let stamped = format_date(taken_date(&broken).unwrap(), &settings.date_format);
+
+    let report = import_files(&[broken, good.clone()], &settings);
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.imported, 1);
+    let plain = settings
+        .dest_root
+        .join(&stamped)
+        .join(format!("{stamped}_IMG_1.jpg"));
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&good).unwrap(),
+        "the good file must land under the plain name"
+    );
+    assert!(
+        !settings
+            .dest_root
+            .join(&stamped)
+            .join(format!("{stamped}_IMG_1-1.jpg"))
+            .exists(),
+        "a failed copy must not push the next file onto a suffix"
+    );
+}
+
 // ---------- settings persistence (importer-cb5.4) ----------
 
 #[test]
