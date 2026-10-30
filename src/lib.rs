@@ -6,9 +6,23 @@
 //! parser).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use chrono::{Datelike, Local, NaiveDateTime, Timelike};
 use nom_exif::{ExifTag, Metadata, TrackInfoTag, read_metadata};
+
+/// Bounds of the parallel-imports stepper, and its fresh-install value.
+pub const MIN_CONCURRENCY: usize = 1;
+pub const MAX_CONCURRENCY: usize = 10;
+pub const DEFAULT_CONCURRENCY: usize = 3;
+
+/// Bring any concurrency value inside [`MIN_CONCURRENCY`]..=[`MAX_CONCURRENCY`].
+/// Settings can arrive from a hand-edited file, the form or the stepper, so
+/// every one of those paths clamps here rather than at the use site.
+pub fn clamp_concurrency(n: usize) -> usize {
+    n.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY)
+}
 
 /// User-configured preferences that drive where and how files are written.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +32,9 @@ pub struct Settings {
     /// Token format (`YYYYMMDD`, `YYYY-MM-DD`, `YYYYMMDD_HHMMSS`) driving
     /// both the date folder name and the file-name prefix.
     pub date_format: String,
+    /// How many files one Import may copy at once, always within
+    /// [`MIN_CONCURRENCY`]..=[`MAX_CONCURRENCY`].
+    pub concurrency: usize,
 }
 
 impl Default for Settings {
@@ -29,6 +46,7 @@ impl Default for Settings {
         Self {
             dest_root,
             date_format: "YYYYMMDD".to_string(),
+            concurrency: DEFAULT_CONCURRENCY,
         }
     }
 }
@@ -46,9 +64,9 @@ pub struct Report {
 /// Where settings persist: `$XDG_CONFIG_HOME/importer/settings.conf`, falling
 /// back to `~/.config/importer/settings.conf`.
 ///
-/// shortcut: flat `key=value` lines — enough while settings are two strings;
-/// switch to a serialized format (toml + serde) when a setting arrives that
-/// isn't a flat string.
+/// shortcut: flat `key=value` lines, numbers parsed per key — enough while
+/// settings stay flat; switch to a serialized format (toml + serde) when one
+/// arrives that isn't a flat scalar.
 pub fn settings_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -79,6 +97,13 @@ pub fn load_settings_from(path: &Path) -> Settings {
         match key {
             "dest_root" if !value.is_empty() => settings.dest_root = PathBuf::from(value),
             "date_format" if !value.is_empty() => settings.date_format = value.to_string(),
+            // A hand-edited file must not inject 0 or 500; anything that isn't
+            // a number keeps the default.
+            "concurrency" => {
+                if let Ok(n) = value.parse::<usize>() {
+                    settings.concurrency = clamp_concurrency(n);
+                }
+            }
             _ => {} // unknown keys: forward-compatible, ignored
         }
     }
@@ -97,18 +122,25 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> std::io::Result<()>
     std::fs::write(
         path,
         format!(
-            "dest_root={}\ndate_format={}\n",
+            "dest_root={}\ndate_format={}\nconcurrency={}\n",
             settings.dest_root.display(),
-            settings.date_format
+            settings.date_format,
+            settings.concurrency
         ),
     )
 }
 
-/// Build the [`Settings`] to persist from raw settings-form text. Values are
-/// trimmed; a field the user emptied keeps its current value — the flat file
-/// format can't represent an empty value (see [`load_settings_from`]), and an
-/// empty Destination root would scatter the next import into relative folders.
-pub fn settings_from_form(dest_root: &str, date_format: &str, current: &Settings) -> Settings {
+/// Build the [`Settings`] to persist from raw settings-form text plus the
+/// stepper's value. Values are trimmed; a field the user emptied keeps its
+/// current value — the flat file format can't represent an empty value (see
+/// [`load_settings_from`]), and an empty Destination root would scatter the
+/// next import into relative folders.
+pub fn settings_from_form(
+    dest_root: &str,
+    date_format: &str,
+    concurrency: usize,
+    current: &Settings,
+) -> Settings {
     let dest_root = dest_root.trim();
     let date_format = date_format.trim();
     Settings {
@@ -122,6 +154,7 @@ pub fn settings_from_form(dest_root: &str, date_format: &str, current: &Settings
         } else {
             date_format.to_string()
         },
+        concurrency: clamp_concurrency(concurrency),
     }
 }
 
@@ -270,16 +303,49 @@ pub fn import(roots: &[PathBuf], settings: &Settings) -> Report {
 /// stops the rest of the run. Existing destination files are never
 /// overwritten: identical content is skipped (re-runs are idempotent),
 /// different content gets a `-1` suffix before the extension.
+///
+/// Copies up to `settings.concurrency` files at once, with that many stdlib
+/// scoped workers sharing a cursor over `files`. The outcomes (and therefore
+/// [`Report::mappings`]) are always reported in `files` order, so for inputs
+/// with distinct content a run at 2+ has the same order and counts as a
+/// sequential one. At 1 this is today's loop.
+///
+/// Two *byte-identical* files landing in the same window are the exception to
+/// the counts: the first reserves a name (empty) before its bytes land, so the
+/// second cannot see identical content yet and claims a `-N` suffix instead of
+/// reporting a skip. Accepted, and nothing is lost — both files are on disk at
+/// distinct names. The alternative is holding the name lock across the copy,
+/// which serializes exactly what this parallelizes.
 pub fn import_files(files: &[PathBuf], settings: &Settings) -> Report {
+    let workers = clamp_concurrency(settings.concurrency).min(files.len());
+    let outcomes: Vec<Option<Outcome>> = if workers > 1 {
+        let outcomes = Mutex::new(files.iter().map(|_| None).collect::<Vec<_>>());
+        let cursor = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(src) = files.get(i) else { break };
+                    let outcome = import_file(src, settings);
+                    outcomes.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+                });
+            }
+        });
+        outcomes.into_inner().unwrap_or_else(|e| e.into_inner())
+    } else {
+        // Empty list, or the user asked for 1: exactly the old loop.
+        files.iter().map(|src| Some(import_file(src, settings))).collect()
+    };
     let mut report = Report::default();
-    for src in files {
-        match import_file(src, settings) {
-            Outcome::Imported(dest) => {
+    for (src, outcome) in files.iter().zip(outcomes) {
+        match outcome {
+            Some(Outcome::Imported(dest)) => {
                 report.mappings.push((src.clone(), dest));
                 report.imported += 1;
             }
-            Outcome::Skipped(_) => report.skipped += 1,
-            Outcome::Failed => report.failed += 1,
+            Some(Outcome::Skipped(_)) => report.skipped += 1,
+            // A worker visits every file, so `None` can't happen.
+            Some(Outcome::Failed) | None => report.failed += 1,
         }
     }
     report
@@ -304,30 +370,66 @@ pub fn import_file(src: &Path, settings: &Settings) -> Outcome {
     let dir = settings.dest_root.join(&stamped);
     let primary = dir.join(format!("{stamped}_{}", name.to_string_lossy()));
 
-    // 0 tries the plain name, then -1, -2, … A free slot means this content
-    // isn't here yet; an occupied slot with our exact bytes means it already
-    // is (idempotent re-run). Bound the hunt so a pathological Source can't
-    // spin forever.
+    let claim = {
+        let _guard = NAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        claim_name(&primary, src, &dir)
+    };
+    match claim {
+        Claim::Reserved(dest) => match std::fs::copy(src, &dest) {
+            Ok(_) => Outcome::Imported(dest),
+            Err(_) => {
+                // A failed copy must not leave its claim behind, or the next
+                // file wanting this name would be pushed onto a suffix.
+                let _ = std::fs::remove_file(&dest);
+                Outcome::Failed
+            }
+        },
+        Claim::Skipped(dest) => Outcome::Skipped(dest),
+        Claim::Failed => Outcome::Failed,
+    }
+}
+
+/// Serializes the Destination name hunt across every Import in this process.
+/// Held only while probing a name (and comparing existing content), never
+/// across a copy.
+static NAME_LOCK: Mutex<()> = Mutex::new(());
+
+enum Claim {
+    /// The name is ours: the file was created exclusively (and is empty).
+    Reserved(PathBuf),
+    Skipped(PathBuf),
+    Failed,
+}
+
+/// Find a free Destination name and create it exclusively so another file
+/// cannot claim it too. 0 tries the plain name, then -1, -2, … An occupied
+/// slot with our exact bytes means the content is already here (idempotent
+/// re-run). Bound the hunt so a pathological Source can't spin forever.
+fn claim_name(primary: &Path, src: &Path, dir: &Path) -> Claim {
+    if std::fs::create_dir_all(dir).is_err() {
+        return Claim::Failed;
+    }
     for n in 0..10_000u32 {
         let dest = if n == 0 {
-            primary.clone()
+            primary.to_path_buf()
         } else {
-            suffixed(&primary, n)
+            suffixed(primary, n)
         };
-        if !dest.exists() {
-            if std::fs::create_dir_all(&dir).is_err() {
-                return Outcome::Failed;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(_) => return Claim::Reserved(dest),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if same_content(src, &dest) {
+                    return Claim::Skipped(dest);
+                }
             }
-            return match std::fs::copy(src, &dest) {
-                Ok(_) => Outcome::Imported(dest),
-                Err(_) => Outcome::Failed,
-            };
-        }
-        if same_content(src, &dest) {
-            return Outcome::Skipped(dest);
+            Err(_) => return Claim::Failed,
         }
     }
-    Outcome::Failed
+    Claim::Failed
 }
 
 /// `name.jpg` → `name-1.jpg` (suffix before the extension, on the already

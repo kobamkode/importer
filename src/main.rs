@@ -4,6 +4,7 @@
 //! (the text-input widget lives in the `field` module).
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, KeyBinding, Render, Task,
@@ -12,8 +13,8 @@ use gpui::{
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
 use importer::{
-    Outcome, Settings, detect_roots, format_date, import_file, load_settings, save_settings,
-    scan, settings_from_form,
+    Outcome, Settings, clamp_concurrency, detect_roots, format_date, import_file, load_settings,
+    save_settings, scan, settings_from_form,
 };
 
 mod field;
@@ -49,10 +50,17 @@ struct Main {
     cancelled: bool,
     finished: bool,
     source_lost: bool,
+    /// When the first file of this run launched; `None` outside a run.
+    started_at: Option<Instant>,
+    /// This run's duration, frozen when it ends so the summary stops moving.
+    elapsed: Option<Duration>,
     task: Option<Task<()>>,
     screen: Screen,
     dest_field: Entity<Field>,
     format_field: Entity<Field>,
+    /// Stepper value while the settings form is open; only Save writes it
+    /// into [`Settings`].
+    concurrency: usize,
     save_error: Option<String>,
 }
 
@@ -61,6 +69,7 @@ impl Main {
         let settings = load_settings();
         let rows = Self::scan_rows();
         Self {
+            concurrency: settings.concurrency,
             settings,
             rows,
             imported: 0,
@@ -70,6 +79,8 @@ impl Main {
             cancelled: false,
             finished: false,
             source_lost: false,
+            started_at: None,
+            elapsed: None,
             task: None,
             screen: Screen::Import,
             dest_field: cx.new(|cx| Field::new("Destination root", cx)),
@@ -93,10 +104,15 @@ impl Main {
 
     fn summary(&self) -> Option<String> {
         (!self.running && self.finished).then(|| {
-            format!(
+            let mut summary = format!(
                 "{} imported · {} failed · {} skipped",
                 self.imported, self.failed, self.skipped
-            )
+            );
+            // Only runs that launched at least one file have a duration.
+            if let Some(elapsed) = self.elapsed {
+                summary.push_str(&format!(" · took {:.1}s", elapsed.as_secs_f64()));
+            }
+            summary
         })
     }
 
@@ -138,10 +154,16 @@ impl Main {
         self.cancelled = false;
         self.finished = false;
         self.source_lost = false;
+        self.started_at = None;
+        self.elapsed = None;
     }
 
-    /// Import starts only on click, one file at a time on the background
-    /// executor so the window keeps painting; each completion repaints its row.
+    /// Import starts only on click. Files launch in windows of
+    /// `Settings.concurrency` on the background executor and the next window
+    /// waits for the previous one to drain, so no more than N copies run at
+    /// once. Each row paints its own outcome as it lands (out of order is
+    /// fine); counts and the bar are derived from row outcomes. At 1 this is
+    /// one window per file, today's loop.
     fn start(&mut self, cx: &mut Context<Self>) {
         if self.running || self.rows.is_empty() {
             return;
@@ -154,45 +176,65 @@ impl Main {
         self.running = true;
         let total = self.rows.len();
         self.task = Some(cx.spawn(async move |this, cx| {
-            for i in 0..total {
-                let next = this.update(cx, |this, _| {
+            let mut next = 0;
+            while next < total {
+                // Take the next window, or break: cancelled, or Source gone.
+                let window = this.update(cx, |this, _| {
                     if this.cancelled {
                         return None;
                     }
-                    this.rows
-                        .get(i)
-                        .map(|row| (row.src.clone(), this.settings.clone()))
-                });
-                let Ok(next) = next else { return };
-                let Some((src, settings)) = next else { break };
-                // The Source can vanish mid-run (unmounted/unplugged).
-                // Stop instead of walking the rest of the rows as failures —
-                // remaining rows stay pending and Refresh recovers.
-                if !src.exists() {
-                    this.update(cx, |this, cx| {
+                    let end = (next + clamp_concurrency(this.settings.concurrency)).min(total);
+                    let window = (next..end)
+                        .filter_map(|i| {
+                            this.rows
+                                .get(i)
+                                .map(|row| (i, row.src.clone(), this.settings.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    // Every Source in the window is checked before launching it
+                    // (importer-tk5.3): files already copying when the Source
+                    // vanishes fail on their own, while a row whose Source is
+                    // already gone stops the run here with its rows still
+                    // pending and earlier results intact.
+                    if !window.iter().all(|(_, src, _)| src.exists()) {
                         this.source_lost = true;
-                        this.running = false;
-                        this.finished = true;
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-                let outcome = cx
-                    .background_executor()
-                    .spawn(async move { import_file(&src, &settings) })
-                    .await;
-                let applied = this.update(cx, |this, cx| {
-                    this.apply(i, outcome);
-                    cx.notify();
+                        return None;
+                    }
+                    // The clock starts with the first launch, so any wait
+                    // before the copy loop is excluded.
+                    this.started_at.get_or_insert_with(Instant::now);
+                    Some((end, window))
                 });
-                if applied.is_err() {
-                    return;
+                let Ok(window) = window else { return };
+                let Some((end, window)) = window else { break };
+                // The window's own end, not its length: the driver no longer
+                // depends on the window matching `end - next` row for row.
+                next = end;
+                let mut launches = Vec::with_capacity(window.len());
+                for (i, src, settings) in window {
+                    // Separate task per row so a fast file paints its row
+                    // without waiting for the slowest one in the window.
+                    let this = this.clone();
+                    launches.push(cx.spawn(async move |cx| {
+                        let outcome = cx
+                            .background_executor()
+                            .spawn(async move { import_file(&src, &settings) })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.apply(i, outcome);
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                }
+                for launch in launches {
+                    launch.await;
                 }
             }
             this.update(cx, |this, cx| {
                 this.running = false;
                 this.finished = true;
+                this.elapsed = this.started_at.take().map(|started| started.elapsed());
                 cx.notify();
             })
             .ok();
@@ -200,8 +242,9 @@ impl Main {
         cx.notify();
     }
 
-    /// Flag-based cancel: the current file finishes (never a partial copy at
-    /// the Destination), the loop stops before the next one.
+    /// Flag-based cancel: the in-flight window finishes (never a partial copy
+    /// at the Destination), no new window starts, and the status stays
+    /// "cancelling…" until those files drain.
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if !self.running || self.cancelled {
             return;
@@ -217,6 +260,7 @@ impl Main {
         let fmt = self.settings.date_format.clone();
         self.dest_field.update(cx, |field, cx| field.set_text(&dest, cx));
         self.format_field.update(cx, |field, cx| field.set_text(&fmt, cx));
+        self.concurrency = self.settings.concurrency;
         self.save_error = None;
         self.screen = Screen::Settings;
         cx.focus_view(&self.dest_field, window);
@@ -229,7 +273,7 @@ impl Main {
     fn save_settings_view(&mut self, cx: &mut Context<Self>) {
         let dest = self.dest_field.read(cx).text();
         let fmt = self.format_field.read(cx).text();
-        let new = settings_from_form(&dest, &fmt, &self.settings);
+        let new = settings_from_form(&dest, &fmt, self.concurrency, &self.settings);
         match save_settings(&new) {
             Ok(()) => {
                 self.settings = new;
@@ -416,8 +460,9 @@ impl Main {
     }
 
     /// The settings form: two editable fields populated from the persisted
-    /// Settings, a live preview from the core's own formatter, Save/Back.
-    /// Enter inside a field bubbles up here as Commit and saves.
+    /// Settings, the parallel-imports stepper, a live preview from the core's
+    /// own formatter, Save/Back. Enter inside a field bubbles up here as
+    /// Commit and saves.
     fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let dest = self.dest_field.read(cx).text();
         let fmt = self.format_field.read(cx).text();
@@ -460,6 +505,18 @@ impl Main {
                     .py_4()
                     .child(Self::form_row("Destination", self.dest_field.clone()))
                     .child(Self::form_row("Date format", self.format_field.clone()))
+                    .child(Self::form_row(
+                        "Parallel imports",
+                        div().flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(self.stepper(cx))
+                            .child(
+                                div().text_xs()
+                                    .text_color(rgb(0x556677))
+                                    .child("How many files are copied at once — more in flight is not a speed guarantee"),
+                            ),
+                    ))
                     .child(
                         div().flex()
                             .items_start()
@@ -511,9 +568,45 @@ impl Main {
             .into_any_element()
     }
 
-    /// Label-left / control-right row; the field takes the remaining width,
+    /// `− N +` built from the footer pill buttons; stops at the bounds instead
+    /// of wrapping, so 1 and 10 are visible dead ends.
+    fn stepper(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex()
+            .items_center()
+            .gap_3()
+            .child(Self::button(
+                cx,
+                "concurrency-down",
+                "−",
+                0x2a3242,
+                0x3a465e,
+                |this, cx| {
+                    this.concurrency = clamp_concurrency(this.concurrency.saturating_sub(1));
+                    cx.notify();
+                },
+            ))
+            .child(
+                div().w(px(28.))
+                    .text_center()
+                    .text_size(px(15.))
+                    .child(self.concurrency.to_string()),
+            )
+            .child(Self::button(
+                cx,
+                "concurrency-up",
+                "+",
+                0x2a3242,
+                0x3a465e,
+                |this, cx| {
+                    this.concurrency = clamp_concurrency(this.concurrency.saturating_add(1));
+                    cx.notify();
+                },
+            ))
+    }
+
+    /// Label-left / control-right row; the control takes the remaining width,
     /// so the form tracks window resizing instead of floating in dead space.
-    fn form_row(label: &'static str, field: Entity<Field>) -> impl IntoElement {
+    fn form_row(label: &'static str, control: impl IntoElement) -> impl IntoElement {
         div().flex()
             .items_center()
             .gap_4()
@@ -524,7 +617,7 @@ impl Main {
                     .text_color(rgb(0x7d8aa0))
                     .child(label),
             )
-            .child(div().flex_1().min_w_0().child(field))
+            .child(div().flex_1().min_w_0().child(control))
     }
 }
 

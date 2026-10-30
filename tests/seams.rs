@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use importer::{Settings, format_date, import_files, load_settings_from, save_settings_to, taken_date};
+use importer::{
+    DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY, Settings, format_date, import_files,
+    load_settings_from, save_settings_to, taken_date,
+};
 use tempfile::TempDir;
 
 fn fixture(name: &str) -> PathBuf {
@@ -69,6 +72,7 @@ fn settings_in(dir: &TempDir, fmt: &str) -> Settings {
     Settings {
         dest_root: dir.path().join("dest"),
         date_format: fmt.to_string(),
+        ..Settings::default()
     }
 }
 
@@ -244,6 +248,7 @@ fn import_from_roots_produces_full_counts() {
     let settings = Settings {
         dest_root: dest.path().to_path_buf(),
         date_format: "YYYYMMDD".into(),
+        ..Settings::default()
     };
 
     let report = importer::import(&[root.path().to_path_buf()], &settings);
@@ -276,6 +281,198 @@ fn same_name_different_content_gets_suffix() {
     assert!(d.join("20261010_IMG_1-1.jpg").exists());
 }
 
+// ---------- parallel imports (importer-tk5.3) ----------
+
+/// A Source tree with distinct names and Taken Dates: three JPEGs on
+/// different days plus one video. No collisions, so a run at any concurrency
+/// must land exactly the same files under the same names.
+fn sample_source(dir: &Path) -> Vec<PathBuf> {
+    std::fs::create_dir_all(dir.join("DCIM/100CANON")).unwrap();
+    let files = vec![
+        jpeg_with_exif(dir, "IMG_0001.jpg", "2026:10:10 14:32:55"),
+        jpeg_with_exif(dir, "IMG_0002.jpg", "2026:10:11 08:00:00"),
+        jpeg_with_exif(dir, "IMG_0003.jpg", "2026:10:12 09:30:00"),
+    ];
+    let clip = dir.join("DCIM/100CANON/MVI_0004.mp4");
+    std::fs::copy(fixture("clip.mp4"), &clip).unwrap();
+    files.into_iter().chain([clip]).collect()
+}
+
+#[test]
+fn concurrency_1_and_3_produce_the_same_import() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("source");
+    let files = sample_source(&source);
+
+    let run = |concurrency: usize, root: &str| {
+        let settings = Settings {
+            dest_root: dir.path().join(root),
+            date_format: "YYYYMMDD".into(),
+            concurrency,
+        };
+        let report = import_files(&files, &settings);
+        (settings.dest_root, report)
+    };
+    let (one_root, one) = run(1, "dest-one");
+    let (three_root, three) = run(3, "dest-three");
+
+    assert_eq!(one.imported, files.len(), "every file lands one at a time");
+    assert_eq!(
+        (three.imported, three.failed, three.skipped),
+        (one.imported, one.failed, one.skipped),
+        "the same inputs report the same counts at 1 and 3"
+    );
+
+    // Destinations as paths relative to their root, so the two runs compare.
+    let destinations = |report: &importer::Report, root: &Path| -> Vec<(String, String)> {
+        report
+            .mappings
+            .iter()
+            .map(|(src, dest)| {
+                (
+                    src.strip_prefix(&source).unwrap().display().to_string(),
+                    dest.strip_prefix(root).unwrap().display().to_string(),
+                )
+            })
+            .collect()
+    };
+    let one_map = destinations(&one, &one_root);
+    let three_map = destinations(&three, &three_root);
+    assert_eq!(
+        one_map, three_map,
+        "same Sources map to the same Destination paths at 1 and 3"
+    );
+    for (_, dest) in &one_map {
+        assert_eq!(
+            std::fs::read(one_root.join(dest)).unwrap(),
+            std::fs::read(three_root.join(dest)).unwrap(),
+            "Destination bytes must not depend on concurrency: {dest}"
+        );
+    }
+}
+
+#[test]
+fn colliding_names_both_land_at_concurrency_3() {
+    let dir = TempDir::new().unwrap();
+    // Two different files, same file name, same Taken Date → same Destination
+    // name. At 3 they are claimed in the same window, which is the contention
+    // the reservation lock must survive: both land, neither clobbered.
+    let jpeg = jpeg_with_exif(dir.path(), "IMG_1.jpg", "2026:10:10 14:32:55");
+    let video = dir.path().join("other").join("IMG_1.jpg");
+    std::fs::create_dir_all(video.parent().unwrap()).unwrap();
+    std::fs::copy(fixture("clip.mp4"), &video).unwrap();
+    let settings = Settings {
+        concurrency: 3,
+        ..settings_in(&dir, "YYYYMMDD")
+    };
+
+    let report = import_files(&[jpeg.clone(), video.clone()], &settings);
+
+    assert_eq!(report.imported, 2, "both land, neither overwritten");
+    assert_eq!(report.failed, 0);
+    let date_dir = settings.dest_root.join("20261010");
+    let mut names: Vec<String> = std::fs::read_dir(&date_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["20261010_IMG_1-1.jpg", "20261010_IMG_1.jpg"],
+        "one plain name and one suffix, nothing else"
+    );
+    let mut landed: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(date_dir.join(name)).unwrap())
+        .collect();
+    let mut sources = vec![
+        std::fs::read(&jpeg).unwrap(),
+        std::fs::read(&video).unwrap(),
+    ];
+    landed.sort();
+    sources.sort();
+    assert_eq!(landed, sources, "both files land byte-for-byte intact");
+}
+
+// ---------- failed copy cleanup (importer-tk5.2) ----------
+
+/// A Source that yields a Taken Date (its mtime) but that `std::fs::copy`
+/// cannot read: a directory named like a photo. It fails *after* the
+/// Destination name is claimed, which is the path the cleanup must survive.
+fn uncopyable_source(dir: &Path, file_name: &str, mtime: SystemTime) -> PathBuf {
+    let path = dir.join(file_name);
+    std::fs::create_dir(&path).unwrap();
+    std::fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
+    path
+}
+
+#[test]
+fn failed_copy_leaves_no_file_at_claimed_destination() {
+    let dir = TempDir::new().unwrap();
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1767323045);
+    let broken = uncopyable_source(dir.path(), "IMG_1.jpg", mtime);
+    let settings = settings_in(&dir, "YYYYMMDD");
+    let stamped = format_date(taken_date(&broken).unwrap(), &settings.date_format);
+
+    let report = import_files(&[broken], &settings);
+
+    assert_eq!(report.failed, 1);
+    let claimed = settings
+        .dest_root
+        .join(&stamped)
+        .join(format!("{stamped}_IMG_1.jpg"));
+    assert!(
+        !claimed.exists(),
+        "failed copy must remove its claimed name: {}",
+        claimed.display()
+    );
+}
+
+#[test]
+fn file_after_failed_copy_gets_plain_name() {
+    let dir = TempDir::new().unwrap();
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1767323045);
+    let broken = uncopyable_source(dir.path(), "IMG_1.jpg", mtime);
+    // Same file name and Taken Date as `broken`, but this one can be copied.
+    let good = dir.path().join("other").join("IMG_1.jpg");
+    std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+    std::fs::copy(fixture("base.jpg"), &good).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&good)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    // Sequential on purpose: "after a failed copy" is a guarantee about the
+    // order files are launched in. In one parallel window the good file may
+    // claim its name while the broken one still holds the plain name.
+    let mut settings = settings_in(&dir, "YYYYMMDD");
+    settings.concurrency = 1;
+    let stamped = format_date(taken_date(&broken).unwrap(), &settings.date_format);
+
+    let report = import_files(&[broken, good.clone()], &settings);
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.imported, 1);
+    let plain = settings
+        .dest_root
+        .join(&stamped)
+        .join(format!("{stamped}_IMG_1.jpg"));
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&good).unwrap(),
+        "the good file must land under the plain name"
+    );
+    assert!(
+        !settings
+            .dest_root
+            .join(&stamped)
+            .join(format!("{stamped}_IMG_1-1.jpg"))
+            .exists(),
+        "a failed copy must not push the next file onto a suffix"
+    );
+}
+
 // ---------- settings persistence (importer-cb5.4) ----------
 
 #[test]
@@ -285,12 +482,51 @@ fn settings_round_trip() {
     let settings = Settings {
         dest_root: dir.path().join("somewhere/photos"),
         date_format: "YYYY-MM-DD".into(),
+        concurrency: 7,
     };
 
     save_settings_to(&path, &settings).unwrap();
     let loaded = load_settings_from(&path);
 
     assert_eq!(loaded, settings);
+    // The number is a fourth flat key, not a format change.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("concurrency=7"), "saved file: {text}");
+}
+
+#[test]
+fn file_without_concurrency_loads_3_and_keeps_other_settings() {
+    // A settings file written before the setting existed.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.conf");
+    std::fs::write(&path, "dest_root=/cards/imports\ndate_format=YYYY-MM-DD\n").unwrap();
+
+    let loaded = load_settings_from(&path);
+
+    assert_eq!(loaded.concurrency, 3);
+    assert_eq!(loaded.dest_root, PathBuf::from("/cards/imports"));
+    assert_eq!(loaded.date_format, "YYYY-MM-DD");
+}
+
+#[test]
+fn out_of_range_or_non_numeric_concurrency_is_clamped_on_load() {
+    let dir = TempDir::new().unwrap();
+
+    for (written, expected) in [
+        ("0", MIN_CONCURRENCY),
+        ("11", MAX_CONCURRENCY),
+        ("500", MAX_CONCURRENCY),
+        ("many", DEFAULT_CONCURRENCY),
+        ("-2", DEFAULT_CONCURRENCY),
+    ] {
+        let path = dir.path().join(format!("{written}.conf"));
+        std::fs::write(&path, format!("concurrency={written}\n")).unwrap();
+        assert_eq!(
+            load_settings_from(&path).concurrency,
+            expected,
+            "concurrency={written} must land inside 1–10"
+        );
+    }
 }
 
 #[test]
@@ -299,6 +535,7 @@ fn missing_settings_file_yields_defaults_through_entry_point() {
     let mut settings = load_settings_from(&dir.path().join("nope.conf"));
     assert_eq!(settings, Settings::default());
     assert_eq!(settings.date_format, "YYYYMMDD");
+    assert_eq!(settings.concurrency, 3, "fresh install defaults to 3 files at once");
     assert!(
         settings.dest_root.ends_with("Pictures/Imports"),
         "default dest is under HOME: {}",
@@ -320,6 +557,7 @@ fn changing_date_format_changes_next_import() {
     let mut settings = Settings {
         dest_root: dir.path().join("dest"),
         date_format: "YYYY-MM-DD".into(),
+        ..Settings::default()
     };
     save_settings_to(&path, &settings).unwrap();
 
@@ -353,6 +591,7 @@ fn settings_file_is_the_single_mechanism() {
     // Empty value rejected at the boundary → default kept.
     assert_eq!(loaded.date_format, "YYYYMMDD");
     assert_eq!(loaded.dest_root, Settings::default().dest_root);
+    assert_eq!(loaded.concurrency, 3);
 }
 
 // ---------- settings form input (importer-cb5.6) ----------
@@ -362,14 +601,16 @@ fn form_text_builds_settings_with_empty_fallback() {
     let current = Settings {
         dest_root: PathBuf::from("/photos/imports"),
         date_format: "YYYYMMDD".into(),
+        concurrency: 3,
     };
 
-    // Non-empty fields are trimmed and used.
+    // Non-empty fields are trimmed and used; the stepper value rides along.
     assert_eq!(
-        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", &current),
+        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, &current),
         Settings {
             dest_root: PathBuf::from("/new/dest"),
             date_format: "YYYY-MM-DD".into(),
+            concurrency: 7,
         }
     );
 
@@ -377,14 +618,15 @@ fn form_text_builds_settings_with_empty_fallback() {
     // empty value, and an empty Destination root would scatter the next
     // import into relative folders.
     assert_eq!(
-        importer::settings_from_form("", "", &current),
+        importer::settings_from_form("", "", current.concurrency, &current),
         current
     );
     assert_eq!(
-        importer::settings_from_form("", "YYYYMMDD_HHMMSS", &current),
+        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, &current),
         Settings {
             dest_root: current.dest_root.clone(),
             date_format: "YYYYMMDD_HHMMSS".into(),
+            concurrency: 1,
         }
     );
 }
