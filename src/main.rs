@@ -168,7 +168,7 @@ impl Main {
                 });
                 let Ok(next) = next else { return };
                 let Some((src, settings)) = next else { break };
-                // The Source can vanish mid-run (card unmounted/unplugged).
+                // The Source can vanish mid-run (unmounted/unplugged).
                 // Stop instead of walking the rest of the rows as failures —
                 // remaining rows stay pending and Refresh recovers.
                 if !src.exists() {

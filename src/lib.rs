@@ -184,7 +184,7 @@ pub fn format_date(date: NaiveDateTime, fmt: &str) -> String {
 }
 
 /// Extensions worth importing — JPEG, HEIC, RAW (CR3/NEF/ARW/DNG), MP4/MOV.
-/// Everything else on a card (`.THM`, sidecars, `MISC/`, `._` files) is
+/// Everything else on the Source (`.THM`, sidecars, `MISC/`, `._` files) is
 /// invisible to the importer.
 const MEDIA_EXTENSIONS: [&str; 9] = [
     "jpg", "jpeg", "heic", "cr3", "nef", "arw", "dng", "mp4", "mov",
@@ -230,7 +230,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         // file_type() does not follow symlinks: symlinked dirs won't be
-        // descended into, which is what keeps cycles off a mounted card.
+        // descended into, which is what keeps cycles off a mounted Source.
         let Ok(file_type) = entry.file_type() else { continue };
         let path = entry.path();
         if file_type.is_dir() {
@@ -293,7 +293,7 @@ fn import_one(src: &Path, settings: &Settings) -> Outcome {
 
     // 0 tries the plain name, then -1, -2, … A free slot means this content
     // isn't here yet; an occupied slot with our exact bytes means it already
-    // is (idempotent re-run). Bound the hunt so a pathological card can't
+    // is (idempotent re-run). Bound the hunt so a pathological Source can't
     // spin forever.
     for n in 0..10_000u32 {
         let dest = if n == 0 {
