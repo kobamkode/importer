@@ -6,6 +6,7 @@
 //! parser).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::{Datelike, Local, NaiveDateTime, Timelike};
@@ -295,16 +296,50 @@ pub fn import(roots: &[PathBuf], settings: &Settings) -> Report {
 /// stops the rest of the run. Existing destination files are never
 /// overwritten: identical content is skipped (re-runs are idempotent),
 /// different content gets a `-1` suffix before the extension.
+///
+/// Copies up to `settings.concurrency` files at once, with that many stdlib
+/// scoped workers sharing a cursor over `files`. The outcomes (and therefore
+/// [`Report::mappings`]) are always reported in `files` order, so a run at 2+
+/// produces the same report as a sequential one. At 1 this is today's loop.
+///
+/// Two *identical-content* files in flight together are not the same as two
+/// sequential ones: the first reserves a name (empty) before its bytes land,
+/// so the second cannot see identical content yet and claims a suffix instead
+/// of being skipped. Accepted — the alternative is holding the name lock
+/// across the copy, which serializes exactly what this parallelizes.
 pub fn import_files(files: &[PathBuf], settings: &Settings) -> Report {
+    let workers = settings
+        .concurrency
+        .clamp(MIN_CONCURRENCY, MAX_CONCURRENCY)
+        .min(files.len());
+    let outcomes: Vec<Option<Outcome>> = if workers > 1 {
+        let outcomes = Mutex::new(files.iter().map(|_| None).collect::<Vec<_>>());
+        let cursor = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(src) = files.get(i) else { break };
+                    let outcome = import_file(src, settings);
+                    outcomes.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+                });
+            }
+        });
+        outcomes.into_inner().unwrap_or_else(|e| e.into_inner())
+    } else {
+        // Empty list, or the user asked for 1: exactly the old loop.
+        files.iter().map(|src| Some(import_file(src, settings))).collect()
+    };
     let mut report = Report::default();
-    for src in files {
-        match import_file(src, settings) {
-            Outcome::Imported(dest) => {
+    for (src, outcome) in files.iter().zip(outcomes) {
+        match outcome {
+            Some(Outcome::Imported(dest)) => {
                 report.mappings.push((src.clone(), dest));
                 report.imported += 1;
             }
-            Outcome::Skipped(_) => report.skipped += 1,
-            Outcome::Failed => report.failed += 1,
+            Some(Outcome::Skipped(_)) => report.skipped += 1,
+            // A worker visits every file, so `None` can't happen.
+            Some(Outcome::Failed) | None => report.failed += 1,
         }
     }
     report
