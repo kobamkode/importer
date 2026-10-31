@@ -11,4 +11,8 @@
 
 # AppImage output
 /Kanistr-*.AppImage
+
+# macOS bundle output
+/Kanistr.app/
+/Kanistr-*.dmg
 /prototype/target/

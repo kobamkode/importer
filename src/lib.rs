@@ -44,8 +44,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        let dest_root = std::env::var_os("HOME")
-            .map(PathBuf::from)
+        let dest_root = home_dir()
             .map(|home| home.join("Pictures").join("Imports"))
             .unwrap_or_else(|| PathBuf::from("Imports"));
         Self {
@@ -54,6 +53,31 @@ impl Default for Settings {
             concurrency: DEFAULT_CONCURRENCY,
             usb_power_fix: false,
         }
+    }
+}
+
+/// The user's home directory. Windows has no `HOME` by default.
+fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var).map(PathBuf::from)
+}
+
+/// Per-user config root, before the `kanistr/` segment.
+fn config_dir() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .unwrap_or_default()
+    } else if cfg!(target_os = "macos") {
+        home_dir()
+            .map(|home| home.join("Library").join("Application Support"))
+            .unwrap_or_default()
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|home| home.join(".config")))
+            .unwrap_or_default()
     }
 }
 
@@ -67,18 +91,15 @@ pub struct Report {
     pub skipped: usize,
 }
 
-/// Where settings persist: `$XDG_CONFIG_HOME/kanistr/settings.conf`, falling
-/// back to `~/.config/kanistr/settings.conf`.
+/// Where settings persist: `kanistr/settings.conf` under the platform's config
+/// root — `$XDG_CONFIG_HOME` (or `~/.config`) on Linux, `~/Library/Application
+/// Support` on macOS, `%APPDATA%` on Windows.
 ///
 /// shortcut: flat `key=value` lines, numbers parsed per key — enough while
 /// settings stay flat; switch to a serialized format (toml + serde) when one
 /// arrives that isn't a flat scalar.
 pub fn settings_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_default();
-    base.join("kanistr").join("settings.conf")
+    config_dir().join("kanistr").join("settings.conf")
 }
 
 /// Read settings, layering values over [`Settings::default`]. A missing file
@@ -192,6 +213,21 @@ fn mtime_date(path: &Path) -> Option<NaiveDateTime> {
     Some(mtime.naive_local())
 }
 
+/// Make a rendered date legal as a single Windows path component. Other
+/// platforms keep the user's format exactly. The result feeds both the date
+/// folder and the file-name prefix, so they can never disagree.
+fn safe_component(rendered: &str, windows: bool) -> String {
+    if !windows {
+        return rendered.to_string();
+    }
+    rendered
+        .chars()
+        .map(|c| if r#"<>:"/\|?*"#.contains(c) { '-' } else { c })
+        .collect::<String>()
+        .trim_end_matches(|c| c == '.' || c == ' ')
+        .to_string()
+}
+
 /// Render a Taken Date with a token format. Uppercase tokens only; every other
 /// character is copied literally. `MM` means month before the first `HH` and
 /// minute after it — that's what makes `YYYYMMDD_HHMMSS` unambiguous.
@@ -236,9 +272,15 @@ const MEDIA_EXTENSIONS: [&str; 9] = [
     "jpg", "jpeg", "heic", "cr3", "nef", "arw", "dng", "mp4", "mov",
 ];
 
-/// Standard Linux mount locations where removable media appears. Returns only
-/// paths that exist — the scan step filters further.
+/// Standard mounted-media locations for this platform, existing paths only —
+/// the scan step filters further.
 pub fn detect_roots() -> Vec<PathBuf> {
+    platform_roots()
+}
+
+/// Linux: per-user mount points and `/mnt`.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn platform_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(user) = std::env::var_os("USER") {
         for base in ["/run/media", "/media"] {
@@ -253,6 +295,50 @@ pub fn detect_roots() -> Vec<PathBuf> {
         roots.push(mnt);
     }
     roots
+}
+
+/// macOS: everything mounted under `/Volumes`. The boot volume is a symlink
+/// there, and `scan` does not follow symlinked directories, so it is skipped.
+#[cfg(target_os = "macos")]
+fn platform_roots() -> Vec<PathBuf> {
+    let volumes = PathBuf::from("/Volumes");
+    if volumes.is_dir() {
+        vec![volumes]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Windows: removable drive letters. Fixed drives are excluded — scanning
+/// `C:\` is never what an import means.
+#[cfg(target_os = "windows")]
+fn platform_roots() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+
+    /// `DRIVE_REMOVABLE` from Win32. Inlined so the crate does not need the
+    /// whole `Win32_System_WindowsProgramming` feature for one constant.
+    const DRIVE_REMOVABLE: u32 = 2;
+
+    let mask = unsafe { GetLogicalDrives() };
+    drive_letters(mask)
+        .into_iter()
+        .filter_map(|letter| {
+            let root = format!("{letter}:\\");
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            let removable = unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_REMOVABLE;
+            let path = PathBuf::from(root);
+            (removable && path.is_dir()).then_some(path)
+        })
+        .collect()
+}
+
+/// Map a `GetLogicalDrives` bitmask (bit 0 = `A:`) to drive letters.
+#[cfg(target_os = "windows")]
+fn drive_letters(mask: u32) -> Vec<char> {
+    (0..26u32)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| char::from(b'A' + i as u8))
+        .collect()
 }
 
 /// Recursively find importable files under `roots`, sorted for a stable run.
@@ -377,7 +463,7 @@ pub enum Outcome {
 /// row can show its own result as it lands.
 pub fn import_file(src: &Path, settings: &Settings) -> Outcome {
     let Some(date) = taken_date(src) else { return Outcome::Failed };
-    let stamped = format_date(date, &settings.date_format);
+    let stamped = safe_component(&format_date(date, &settings.date_format), cfg!(windows));
     let Some(name) = src.file_name() else { return Outcome::Failed };
     let dir = settings.dest_root.join(&stamped);
     let primary = dir.join(format!("{stamped}_{}", name.to_string_lossy()));
@@ -500,5 +586,19 @@ mod tests {
         // MM is month before HH, minute after it.
         assert_eq!(format_date(date, "MM/YYYY"), "10/2026");
         assert_eq!(format_date(date, "DD.MM.YYYY HH:MM"), "10.10.2026 14:32");
+    }
+
+    #[test]
+    fn windows_illegal_characters_are_replaced() {
+        assert_eq!(safe_component("2026-10-10 14:32", true), "2026-10-10 14-32");
+        assert_eq!(safe_component("2026-10-10 14:32", false), "2026-10-10 14:32");
+        // Windows also strips a trailing dot or space.
+        assert_eq!(safe_component("2026.", true), "2026");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn drive_mask_maps_to_letters() {
+        assert_eq!(drive_letters(0b101), vec!['A', 'C']);
     }
 }

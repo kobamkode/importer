@@ -4,6 +4,9 @@
 //! (the text-input widget lives in the `field` module) — and decides whether
 //! and when the opt-in USB power fix runs before an Import.
 
+// No console window behind the app on Windows (but keep stdout for tests).
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -202,7 +205,10 @@ impl Main {
         self.running = true;
         // A few unprivileged sysfs reads, cheap enough for the UI thread: a
         // run that needs nothing must never show "applying…" or spawn sudo.
-        let apply_fix = self.settings.usb_power_fix && usb::is_fix_needed();
+        // The fix is Linux-only; elsewhere the toggle is hidden and this is
+        // false without reading anything.
+        let apply_fix =
+            cfg!(target_os = "linux") && self.settings.usb_power_fix && usb::is_fix_needed();
         if apply_fix {
             // Marked before the task spawns, so no repaint can pair
             // "importing…" with a step that has not started yet.
@@ -586,7 +592,9 @@ impl Main {
                                     .child("How many files are copied at once — more in flight is not a speed guarantee"),
                             ),
                     ))
-                    .child(Self::form_row("USB power fix", self.usb_power_fix_row(cx)))
+                    .when(cfg!(target_os = "linux"), |el| {
+                        el.child(Self::form_row("USB power fix", self.usb_power_fix_row(cx)))
+                    })
                     .child(
                         div().flex()
                             .items_start()
