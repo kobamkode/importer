@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Kanistr
+Comment=Copy photos and videos from a card into dated folders
+Exec=kanistr
+Icon=kanistr
+Terminal=false
+Categories=Graphics;

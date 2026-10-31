@@ -8,4 +8,7 @@
 
 # Cargo build artifacts
 /target/
+
+# AppImage output
+/Kanistr-*.AppImage
 /prototype/target/
