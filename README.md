@@ -41,7 +41,7 @@ concurrency=3
 usb_power_fix=false
 ```
 
-The USB power fix is Linux-only and off by default. When on, it disables USB autosuspend before each import so an idle card reader does not drop off mid-copy. It runs only when needed, uses whatever authentication sudo is set up for, and lasts until reboot.
+The USB power fix is Linux-only and off by default. When on, it disables USB autosuspend before each import so an idle card reader does not drop off mid-copy. It runs only when needed, asks for authentication with sudo or polkit (whichever the launch allows), and lasts until reboot.
 
 ## Develop
 

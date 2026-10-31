@@ -671,7 +671,7 @@ impl Main {
             .child(
                 div().text_xs()
                     .text_color(rgb(0x556677))
-                    .child("Uses sudo only when needed, with your usual sudo authentication. The fix lasts until you reboot."),
+                    .child("Asks for authentication with sudo or polkit only when needed. The fix lasts until you reboot."),
             )
     }
 

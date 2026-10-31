@@ -9,7 +9,8 @@
 //! The decision is a pure function over the control values ([`fix_needed`]) so
 //! it is testable without root, sudo or a real sysfs.
 
-use std::process::Command;
+use std::io::IsTerminal;
+use std::process::{Command, Stdio};
 
 /// Where the kernel-wide autosuspend timeout lives. `-1` disables it.
 const AUTOSUSPEND: &str = "/sys/module/usbcore/parameters/autosuspend";
@@ -62,6 +63,10 @@ fn device_controls() -> Vec<String> {
 /// child inherits stderr so sudo's own diagnostics ("Sorry, try again.") reach
 /// the terminal; the header only carries a generic reason, and the io error
 /// text when sudo cannot even be spawned.
+///
+/// A desktop launch has no terminal for sudo's prompt, so it falls back to
+/// polkit (`pkexec`), which asks through the desktop's authentication agent.
+/// Cached or passwordless sudo still runs silently first.
 pub fn apply() -> Result<(), String> {
     if !is_fix_needed() {
         return Ok(());
@@ -73,22 +78,81 @@ pub fn apply() -> Result<(), String> {
         "echo {SAFE_AUTOSUSPEND} > {AUTOSUSPEND} && \
          for c in {DEVICES}/*/power/control; do echo {SAFE_CONTROL} > \"$c\" 2>/dev/null || true; done"
     );
-    let status = Command::new("sudo")
-        .arg("-p")
-        .arg(SUDO_PROMPT)
+
+    // Cached or passwordless sudo needs no prompt at all.
+    if run_sudo(&script, true).is_ok() {
+        return verify();
+    }
+    if std::io::stdin().is_terminal() {
+        return run_sudo(&script, false).and_then(|()| verify());
+    }
+    if pkexec_available() {
+        return run_pkexec(&script).and_then(|()| verify());
+    }
+    // Last resort: sudo with SUDO_ASKPASS, if the user configured one.
+    run_sudo(&script, false).map_err(|_| NO_TERMINAL.to_string())?;
+    verify()
+}
+
+/// Shown when no terminal, no polkit agent and no askpass were available.
+const NO_TERMINAL: &str = "sudo needs a terminal for its password — run Kanistr from a terminal, or install polkit (pkexec)";
+
+fn run_sudo(script: &str, non_interactive: bool) -> Result<(), String> {
+    let mut command = Command::new("sudo");
+    if non_interactive {
+        command.arg("-n").stderr(Stdio::null());
+    } else {
+        command.arg("-p").arg(SUDO_PROMPT);
+    }
+    let status = command
         .arg("/bin/sh")
         .arg("-c")
         .arg(script)
         .status()
         .map_err(|err| format!("could not run sudo: {err}"))?;
-    if !status.success() {
-        return Err("sudo was cancelled or failed".to_string());
+    if status.success() {
+        Ok(())
+    } else {
+        Err("sudo was cancelled or failed".to_string())
     }
-    // Success means the controls now read safe — not merely that sudo exited 0.
+}
+
+fn run_pkexec(script: &str) -> Result<(), String> {
+    let status = Command::new("pkexec")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .status()
+        .map_err(|err| format!("could not run pkexec: {err}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(match status.code() {
+        // pkexec: 126 = the authentication dialog was dismissed.
+        Some(126) => "authentication was cancelled".to_string(),
+        // 127 = not authorized, or no authentication agent could be reached.
+        Some(127) => "polkit could not authenticate (is a polkit agent running?)".to_string(),
+        _ => "authentication failed".to_string(),
+    })
+}
+
+fn pkexec_available() -> bool {
+    Command::new("pkexec")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn verify() -> Result<(), String> {
+    // Success means the controls now read safe — not merely that the helper
+    // exited 0.
     if is_fix_needed() {
-        return Err("the kernel controls still read unsafe".to_string());
+        Err("the kernel controls still read unsafe".to_string())
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
