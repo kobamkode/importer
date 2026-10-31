@@ -22,7 +22,7 @@ Plug the card in, set the destination folder and date format in Settings, press 
 
 ## What it does
 
-It scans the places removable media appears on each system — `/run/media/<user>`, `/media/<user>` and `/mnt` on Linux, `/Volumes` on macOS, removable drive letters on Windows — for JPEG, HEIC, CR3, NEF, ARW, DNG, MP4 and MOV files. Folders named `MISC` and files starting with `._` are ignored.
+It scans the places removable media appears on each system — `/run/media/<user>`, `/media/<user>` and `/mnt` on Linux, `/Volumes` on macOS, removable drive letters on Windows — for JPEG, HEIC, CR3, NEF, ARW, DNG, RAF, MP4 and MOV files. Folders named `MISC` and files starting with `._` are ignored.
 
 Each file lands at `<destination>/<date>/<date>_<original name>`. The date is the photo's EXIF `DateTimeOriginal`, the video's `CreateDate`, or the file's modified time when neither is present. Format tokens are `YYYY`, `MM`, `DD`, `HH` and `SS`. `MM` is the month until the first `HH`, then minutes.
 
