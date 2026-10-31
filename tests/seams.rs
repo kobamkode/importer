@@ -400,18 +400,16 @@ fn colliding_names_both_land_at_concurrency_3() {
 /// A Source that yields a Taken Date (its mtime) but that `std::fs::copy`
 /// cannot read: a directory named like a photo. It fails *after* the
 /// Destination name is claimed, which is the path the cleanup must survive.
-fn uncopyable_source(dir: &Path, file_name: &str, mtime: SystemTime) -> PathBuf {
+fn uncopyable_source(dir: &Path, file_name: &str) -> PathBuf {
     let path = dir.join(file_name);
     std::fs::create_dir(&path).unwrap();
-    std::fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
     path
 }
 
 #[test]
 fn failed_copy_leaves_no_file_at_claimed_destination() {
     let dir = TempDir::new().unwrap();
-    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1767323045);
-    let broken = uncopyable_source(dir.path(), "IMG_1.jpg", mtime);
+    let broken = uncopyable_source(dir.path(), "IMG_1.jpg");
     let settings = settings_in(&dir, "YYYYMMDD");
     let stamped = format_date(taken_date(&broken).unwrap(), &settings.date_format);
 
@@ -432,12 +430,14 @@ fn failed_copy_leaves_no_file_at_claimed_destination() {
 #[test]
 fn file_after_failed_copy_gets_plain_name() {
     let dir = TempDir::new().unwrap();
-    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1767323045);
-    let broken = uncopyable_source(dir.path(), "IMG_1.jpg", mtime);
+    let broken = uncopyable_source(dir.path(), "IMG_1.jpg");
     // Same file name and Taken Date as `broken`, but this one can be copied.
     let good = dir.path().join("other").join("IMG_1.jpg");
     std::fs::create_dir_all(good.parent().unwrap()).unwrap();
     std::fs::copy(fixture("base.jpg"), &good).unwrap();
+    // The directory's mtime is what `taken_date` reads for the broken Source;
+    // copy it onto the good file instead of writing a directory's mtime.
+    let mtime = std::fs::metadata(&broken).unwrap().modified().unwrap();
     std::fs::OpenOptions::new()
         .write(true)
         .open(&good)
