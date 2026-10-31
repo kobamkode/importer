@@ -19,7 +19,7 @@ const SAFE_AUTOSUSPEND: &str = "-1";
 const SAFE_CONTROL: &str = "on";
 /// sudo's prompt, naming the app so the pause is recognisable. `%u` is sudo's
 /// own placeholder for the invoking user.
-const SUDO_PROMPT: &str = "[importer] password for %u: ";
+const SUDO_PROMPT: &str = "[kanistr] password for %u: ";
 
 /// Is the fix needed? `None` means the autosuspend parameter can't be read
 /// (non-Linux), and the feature is inert. Otherwise it is needed when the

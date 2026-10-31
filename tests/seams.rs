@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use importer::{
+use kanistr::{
     DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY, Settings, format_date, import_files,
     load_settings_from, save_settings_to, taken_date,
 };
@@ -165,8 +165,8 @@ fn skipped_file_reports_existing_destination() {
 
     // US13: the user must be able to verify where every file went — skipped
     // files report the Destination path that already holds identical content.
-    match importer::import_file(&src, &settings) {
-        importer::Outcome::Skipped(dest) => assert_eq!(
+    match kanistr::import_file(&src, &settings) {
+        kanistr::Outcome::Skipped(dest) => assert_eq!(
             dest,
             settings.dest_root.join("20261010/20261010_IMG_9.jpg")
         ),
@@ -209,7 +209,7 @@ fn scan_finds_media_recursively_across_roots_and_skips_junk() {
     std::fs::create_dir_all(b.path().join("DCIM")).unwrap();
     std::fs::copy(fixture("base.jpg"), b.path().join("DCIM/IMG_1000.jpg")).unwrap();
 
-    let found = importer::scan(&[a.path().to_path_buf(), b.path().to_path_buf()]);
+    let found = kanistr::scan(&[a.path().to_path_buf(), b.path().to_path_buf()]);
 
     let mut names: Vec<String> = found
         .iter()
@@ -228,7 +228,7 @@ fn misc_directory_is_invisible() {
     std::fs::copy(fixture("base.jpg"), root.path().join("MISC/whatever.jpg")).unwrap();
     std::fs::copy(fixture("base.jpg"), root.path().join("DCIM/keep.jpg")).unwrap();
 
-    let found = importer::scan(&[root.path().to_path_buf()]);
+    let found = kanistr::scan(&[root.path().to_path_buf()]);
 
     assert_eq!(
         found,
@@ -251,14 +251,14 @@ fn import_from_roots_produces_full_counts() {
         ..Settings::default()
     };
 
-    let report = importer::import(&[root.path().to_path_buf()], &settings);
+    let report = kanistr::import(&[root.path().to_path_buf()], &settings);
 
     assert_eq!(report.imported, 2);
     assert_eq!(report.failed, 0);
     assert_eq!(report.skipped, 0);
 
     // Second run: everything already there.
-    let rerun = importer::import(&[root.path().to_path_buf()], &settings);
+    let rerun = kanistr::import(&[root.path().to_path_buf()], &settings);
     assert_eq!(rerun.imported, 0);
     assert_eq!(rerun.skipped, 2, "idempotent re-run");
 }
@@ -325,7 +325,7 @@ fn concurrency_1_and_3_produce_the_same_import() {
     );
 
     // Destinations as paths relative to their root, so the two runs compare.
-    let destinations = |report: &importer::Report, root: &Path| -> Vec<(String, String)> {
+    let destinations = |report: &kanistr::Report, root: &Path| -> Vec<(String, String)> {
         report
             .mappings
             .iter()
@@ -479,7 +479,7 @@ fn file_after_failed_copy_gets_plain_name() {
 #[test]
 fn settings_round_trip() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("importer/settings.conf");
+    let path = dir.path().join("kanistr/settings.conf");
     let settings = Settings {
         dest_root: dir.path().join("somewhere/photos"),
         date_format: "YYYY-MM-DD".into(),
@@ -659,7 +659,7 @@ fn form_text_builds_settings_with_empty_fallback() {
     // Non-empty fields are trimmed and used; the stepper value and the USB
     // toggle ride along, so the form keeps one path into Settings.
     assert_eq!(
-        importer::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, true, &current),
+        kanistr::settings_from_form("  /new/dest \n", " YYYY-MM-DD ", 7, true, &current),
         Settings {
             dest_root: PathBuf::from("/new/dest"),
             date_format: "YYYY-MM-DD".into(),
@@ -668,7 +668,7 @@ fn form_text_builds_settings_with_empty_fallback() {
         }
     );
     assert_eq!(
-        importer::settings_from_form("/new/dest", "YYYY-MM-DD", 7, false, &current),
+        kanistr::settings_from_form("/new/dest", "YYYY-MM-DD", 7, false, &current),
         Settings {
             dest_root: PathBuf::from("/new/dest"),
             date_format: "YYYY-MM-DD".into(),
@@ -681,11 +681,11 @@ fn form_text_builds_settings_with_empty_fallback() {
     // empty value, and an empty Destination root would scatter the next
     // import into relative folders.
     assert_eq!(
-        importer::settings_from_form("", "", current.concurrency, true, &current),
+        kanistr::settings_from_form("", "", current.concurrency, true, &current),
         current
     );
     assert_eq!(
-        importer::settings_from_form("", "YYYYMMDD_HHMMSS", 1, false, &current),
+        kanistr::settings_from_form("", "YYYYMMDD_HHMMSS", 1, false, &current),
         Settings {
             dest_root: current.dest_root.clone(),
             date_format: "YYYYMMDD_HHMMSS".into(),

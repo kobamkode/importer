@@ -1,4 +1,4 @@
-# Importer
+# Kanistr
 
 Copies photos and videos from a mounted card into a dated folder tree. It only reads the card.
 
@@ -22,7 +22,7 @@ Files copy in parallel, 1 to 10 at a time, set in Settings.
 
 ## Settings
 
-Settings are stored in `$XDG_CONFIG_HOME/importer/settings.conf`, or `~/.config/importer/settings.conf` when that variable is unset:
+Settings are stored in `$XDG_CONFIG_HOME/kanistr/settings.conf`, or `~/.config/kanistr/settings.conf` when that variable is unset:
 
 ```ini
 dest_root=/home/you/Pictures/Imports

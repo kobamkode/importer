@@ -1,4 +1,4 @@
-# Importer
+# Kanistr
 
 A tool that copies photos and videos from mounted media into a dated folder tree.
 

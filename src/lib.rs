@@ -67,8 +67,8 @@ pub struct Report {
     pub skipped: usize,
 }
 
-/// Where settings persist: `$XDG_CONFIG_HOME/importer/settings.conf`, falling
-/// back to `~/.config/importer/settings.conf`.
+/// Where settings persist: `$XDG_CONFIG_HOME/kanistr/settings.conf`, falling
+/// back to `~/.config/kanistr/settings.conf`.
 ///
 /// shortcut: flat `key=value` lines, numbers parsed per key — enough while
 /// settings stay flat; switch to a serialized format (toml + serde) when one
@@ -78,7 +78,7 @@ pub fn settings_path() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_default();
-    base.join("importer").join("settings.conf")
+    base.join("kanistr").join("settings.conf")
 }
 
 /// Read settings, layering values over [`Settings::default`]. A missing file

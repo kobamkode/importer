@@ -1,5 +1,5 @@
 //! The gpui shell — variant B layout as approved in the prototype
-//! (bd importer-cb5.1 verdict). All import behavior lives in the `importer`
+//! (bd importer-cb5.1 verdict). All import behavior lives in the `kanistr`
 //! core; this file wires it up — import view plus the settings form
 //! (the text-input widget lives in the `field` module) — and decides whether
 //! and when the opt-in USB power fix runs before an Import.
@@ -13,7 +13,7 @@ use gpui::{
 };
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
-use importer::{
+use kanistr::{
     Outcome, Settings, clamp_concurrency, detect_roots, format_date, import_file, load_settings,
     save_settings, scan, settings_from_form, usb,
 };
@@ -802,7 +802,7 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("importer".into()),
+                    title: Some("Kanistr".into()),
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
