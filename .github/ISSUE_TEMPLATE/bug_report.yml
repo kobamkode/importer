@@ -1,0 +1,73 @@
+name: Bug report
+description: Something in Kanistr does not work as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Import details matter more than prose — fill in what you can.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did Kanistr do, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Plug in a card reader
+        2. Set the destination and date format in Settings
+        3. Press Import
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux (AppImage)
+        - Linux (built from source)
+        - Windows
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Kanistr version
+      description: Release tag or commit, as shown in the download name.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      description: What were you importing from?
+      options:
+        - SD card in a card reader
+        - USB drive
+        - Camera connected as a drive
+        - A folder on disk
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, the exact date format, destination path, or any error text.
+    validations:
+      required: false
