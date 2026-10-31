@@ -265,11 +265,11 @@ pub fn format_date(date: NaiveDateTime, fmt: &str) -> String {
     out
 }
 
-/// Extensions worth importing — JPEG, HEIC, RAW (CR3/NEF/ARW/DNG), MP4/MOV.
+/// Extensions worth importing — JPEG, HEIC, RAW (CR3/NEF/ARW/DNG/RAF), MP4/MOV.
 /// Everything else on the Source (`.THM`, sidecars, `MISC/`, `._` files) is
 /// invisible to the importer.
-const MEDIA_EXTENSIONS: [&str; 9] = [
-    "jpg", "jpeg", "heic", "cr3", "nef", "arw", "dng", "mp4", "mov",
+const MEDIA_EXTENSIONS: [&str; 10] = [
+    "jpg", "jpeg", "heic", "cr3", "nef", "arw", "dng", "raf", "mp4", "mov",
 ];
 
 /// Standard mounted-media locations for this platform, existing paths only —
@@ -586,6 +586,11 @@ mod tests {
         // MM is month before HH, minute after it.
         assert_eq!(format_date(date, "MM/YYYY"), "10/2026");
         assert_eq!(format_date(date, "DD.MM.YYYY HH:MM"), "10.10.2026 14:32");
+    }
+
+    #[test]
+    fn fujifilm_raw_is_media() {
+        assert!(is_media(Path::new("DSCF1234.RAF")));
     }
 
     #[test]
